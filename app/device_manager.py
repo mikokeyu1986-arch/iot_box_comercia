@@ -905,9 +905,11 @@ class DeviceManager:
     def _detect_workspace_root(self) -> Path:
         current = Path(__file__).resolve()
         for candidate in [current, *current.parents]:
+            if (candidate / "custom_addons" / "iot_box_comercia").is_dir():
+                return candidate
             if (candidate / ".venv").exists() and (candidate / "instances").exists():
                 return candidate
-        return current.parents[5]
+        return current.parents[3]
 
     def _ensure_fallback_site_packages(self) -> None:
         if self._fallback_site_packages_added:
@@ -1857,22 +1859,18 @@ class DeviceManager:
         for receipt_item in receipt.get("payment_terminal_receipts") or []:
             if not isinstance(receipt_item, dict):
                 continue
-            terminal_logo_src = str(receipt_item.get("logoSrc") or "").strip()
+            # 禁止在刷卡小票中打印图片，只保留刷卡文字记录。
+            terminal_logo_src = ""
             if terminal_logo_src:
-                image_classes = (
-                    ["payment-terminal-nfc-icon"]
-                    if self._is_payment_terminal_nfc_src(terminal_logo_src)
-                    else ["payment-terminal-logo"]
-                )
                 lines.append(
                     {
                         "type": "image",
                         "src": terminal_logo_src,
                         "align": "center",
-                        "classes": image_classes,
-                        "width": 96,
-                        "height": 48,
-                        "image_kind": "image",
+                        "classes": ["payment-terminal-logo"],
+                        # 只限制宽度，不固定高度，保持原始 PNG 比例。
+                        "width": 179,
+                        "image_kind": "logo",
                     }
                 )
             for text in self._iter_payment_terminal_receipt_lines(receipt_item):
@@ -4650,7 +4648,7 @@ class DeviceManager:
         if "A" in img.getbands():
             alpha = img.getchannel("A")
             alpha_bbox = alpha.getbbox()
-            if alpha_bbox and {"payment-terminal-logo", "payment-terminal-nfc-icon"}.intersection(classes):
+            if alpha_bbox and "payment-terminal-nfc-icon" in classes:
                 pad = 4
                 left = max(0, alpha_bbox[0] - pad)
                 top = max(0, alpha_bbox[1] - pad)
@@ -5109,6 +5107,7 @@ class DeviceManager:
             for trailing_marker in (
                 "OPERACION CONTACTLESS. FIRMA NO NECESARIA.",
                 "OPERACION CON PIN. FIRMA NO NECESARIA.",
+                "OPERACION AUT MOVIL FIRMA NO NECESARIA",
                 "AUTORIZADA",
             ):
                 marker_index = value.upper().find(trailing_marker)
@@ -5128,8 +5127,17 @@ class DeviceManager:
             trailing_message = "OPERACION CONTACTLESS. FIRMA NO NECESARIA."
         elif "OPERACION CON PIN. FIRMA NO NECESARIA." in upper_compact:
             trailing_message = "OPERACION CON PIN. FIRMA NO NECESARIA."
+        elif "OPERACION AUT MOVIL FIRMA NO NECESARIA" in upper_compact:
+            trailing_message = "OPERACION AUT MOVIL FIRMA NO NECESARIA"
         elif "AUTORIZADA" in upper_compact:
             trailing_message = "AUTORIZADA"
+        else:
+            auto_mobile_match = re.search(
+                r"OPERACION\s+AUT\s*MOVIL[.\s-]*FIRMA\s+NO\s+NECESARIA\.?",
+                upper_compact,
+            )
+            if auto_mobile_match:
+                trailing_message = re.sub(r"\s+", " ", auto_mobile_match.group(0)).strip()
 
         if trailing_message:
             normalized_message = re.sub(r"\s+", " ", trailing_message).strip()
@@ -5151,7 +5159,7 @@ class DeviceManager:
             insert_index = len(collected)
             for index, text in enumerate(collected):
                 upper_text = text.upper()
-                if "OPERACION CONTACTLESS" in upper_text or "OPERACION CON PIN" in upper_text or upper_text == "AUTORIZADA":
+                if "OPERACION CONTACTLESS" in upper_text or "OPERACION CON PIN" in upper_text or "OPERACION AUT MOVIL" in upper_text or "OPERACION AUT" in upper_text and "MOVIL" in upper_text or upper_text == "AUTORIZADA":
                     insert_index = index
                     break
             collected[insert_index:insert_index] = etiqueta_lines
@@ -5735,7 +5743,12 @@ else:
             override_path = self.resource_dir / "web" / "nfc_override.png"
             try:
                 if override_path.is_file():
-                    return override_path.read_bytes()
+                    image_data = override_path.read_bytes()
+                    print(
+                        f"[IOT IMAGE TRACE] NFC src={src} -> override={override_path} "
+                        f"bytes={len(image_data)}"
+                    )
+                    return image_data
             except OSError:
                 pass
             return self._generate_local_nfc_icon_png()
