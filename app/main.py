@@ -1,0 +1,1145 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import socket
+import time
+from pathlib import Path
+from typing import Any
+from xml.etree import ElementTree as ET
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from .certificate_manager import CertificateManager
+from .cloud_bridge import OdooCloudBridge
+from .config_store import ConfigStore
+from .dev_logger import dev_log, summarize_action
+from .device_manager import DeviceManager
+from .event_bus import EventBus
+from .models import IoTEvent
+from .odoo_sync import OdooSyncService
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+RESOURCE_DIR = Path(os.getenv("IOT_RESOURCE_DIR", str(BASE_DIR)))
+STATIC_DIR = RESOURCE_DIR / "web"
+SPOOL_DIR = Path(os.getenv("IOT_SPOOL_DIR", str(BASE_DIR / "spool")))
+CONFIG_PATH = Path(os.getenv("IOT_CONFIG_PATH", str(BASE_DIR / "runtime_config.json")))
+CERTS_DIR = Path(os.getenv("IOT_CERTS_DIR", str(BASE_DIR / "certs")))
+
+
+def _detect_local_ip() -> str:
+    """Auto-detect the LAN IP address of this machine.
+
+    Falls back to ``127.0.0.1:8398`` when no suitable LAN interface is found.
+    """
+    env_ip = (os.getenv("IOT_IP") or "").strip()
+    if env_ip:
+        host = env_ip.split(":", 1)[0].strip()
+        if host not in ("", "127.0.0.1", "localhost", "0.0.0.0"):
+            return env_ip
+    # Try to find a non-loopback IPv4 address via UDP trick (does not send
+    # any data — just asks the kernel which interface would be used).
+    port = os.getenv("IOT_PORT", "8398")
+    for target in ("192.168.1.1", "10.0.0.1", "172.16.0.1", "8.8.8.8"):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(0.1)
+                s.connect((target, 1))
+                ip = s.getsockname()[0]
+                if ip and ip != "127.0.0.1":
+                    return f"{ip}:{port}"
+        except (OSError, socket.error):
+            continue
+    return f"127.0.0.1:{port}"
+
+
+IOT_IP = _detect_local_ip()
+
+
+IOT_IP = _detect_local_ip()
+IOT_VERSION = os.getenv("IOT_VERSION", "2026.04.10")
+SPOOL_CLEAN_INTERVAL_SECONDS = int(os.getenv("IOT_SPOOL_CLEAN_INTERVAL_SECONDS", "1800"))
+SPOOL_RETENTION_SECONDS = int(os.getenv("IOT_SPOOL_RETENTION_SECONDS", "1800"))
+IOT_ENABLE_CLOUD_BRIDGE = os.getenv("IOT_ENABLE_CLOUD_BRIDGE", "1").strip().lower() in {"1", "true", "yes", "on"}
+IOT_SSL_VERIFY = os.getenv("IOT_SSL_VERIFY", "1").strip().lower() in {"1", "true", "yes", "on"}
+IOT_P12_PASSWORD = os.getenv("IOT_P12_PASSWORD", "odoo")
+
+_logger = logging.getLogger(__name__)
+_PRINT_ACTIONS = {"print_receipt", "print_receipt_escpos"}
+_iot_action_tasks: set[asyncio.Task[None]] = set()
+
+
+def _suppress_windows_connection_reset(loop: asyncio.AbstractEventLoop) -> None:
+    default_handler = loop.get_exception_handler()
+
+    def handler(loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        exception = context.get("exception")
+        handle = str(context.get("handle") or "")
+        if (
+            os.name == "nt"
+            and isinstance(exception, ConnectionResetError)
+            and getattr(exception, "winerror", None) == 10054
+            and "_ProactorBasePipeTransport._call_connection_lost" in handle
+        ):
+            return
+        if default_handler:
+            default_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handler)
+
+
+def _perf_log(message: str) -> None:
+    if os.getenv("IOT_VERBOSE_PERF_LOGS", "").strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+    print(message, flush=True)
+
+app = FastAPI(title="Restaurant Native Print IoT Box Runtime", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
+
+event_bus = EventBus()
+config_store = ConfigStore(CONFIG_PATH)
+IOT_IDENTIFIER = config_store.ensure_iot_identifier(os.getenv("IOT_IDENTIFIER", ""))
+device_manager = DeviceManager(
+    event_bus,
+    spool_dir=SPOOL_DIR,
+    local_config_getter=config_store.get_local_config,
+    local_config_updater=config_store.update_local_config,
+)
+odoo_sync = OdooSyncService(verify_ssl=IOT_SSL_VERIFY)
+cloud_bridge = OdooCloudBridge(
+    config_store,
+    device_manager,
+    IOT_IDENTIFIER,
+    IOT_IP,
+    IOT_VERSION,
+    verify_ssl=IOT_SSL_VERIFY,
+)
+certificate_manager = CertificateManager(CERTS_DIR, iot_ip=IOT_IP, p12_password=IOT_P12_PASSWORD)
+
+try:
+    from .drivers.scale import ScaleService
+    scale_service = ScaleService(config_store.get_local_config, event_bus=event_bus)
+except ImportError:
+    scale_service = None
+
+
+async def _spool_cleanup_loop() -> None:
+    device_manager.cleanup_spool(SPOOL_RETENTION_SECONDS)
+    while True:
+        await asyncio.sleep(max(1, SPOOL_CLEAN_INTERVAL_SECONDS))
+        device_manager.cleanup_spool(SPOOL_RETENTION_SECONDS)
+
+
+@app.on_event("startup")
+async def startup_tasks() -> None:
+    _suppress_windows_connection_reset(asyncio.get_running_loop())
+    dev_log(
+        "runtime_startup",
+        iot_identifier=IOT_IDENTIFIER,
+        iot_ip=IOT_IP,
+        config_path=str(CONFIG_PATH),
+        spool_dir=str(SPOOL_DIR),
+        cloud_bridge_enabled=IOT_ENABLE_CLOUD_BRIDGE,
+        ssl_verify=IOT_SSL_VERIFY,
+    )
+    app.state.certificate_error = ""
+    try:
+        certificate_manager.ensure()
+    except Exception as exc:
+        app.state.certificate_error = str(exc)
+        _logger.exception("Certificate generation failed; continuing without downloadable certificates")
+    app.state.spool_cleanup_task = asyncio.create_task(_spool_cleanup_loop())
+    await device_manager.startup()
+    if scale_service is not None:
+        try:
+            # 绑定主事件循环，让 ScaleMonitor 子线程能线程安全地推送 SSE 事件
+            # 注意：不在此处启动 ScaleMonitor —— 按需读取模式，等 POS 打开称重界面时才启动
+            scale_service.bind_main_loop(asyncio.get_running_loop())
+        except Exception:
+            _logger.exception("Scale service initialization failed; continuing")
+    if IOT_ENABLE_CLOUD_BRIDGE:
+        app.state.cloud_bridge_task = asyncio.create_task(cloud_bridge.run_forever())
+
+
+@app.on_event("shutdown")
+async def shutdown_tasks() -> None:
+    dev_log("runtime_shutdown", pending_iot_tasks=len(_iot_action_tasks))
+    for task in list(_iot_action_tasks):
+        task.cancel()
+    if _iot_action_tasks:
+        await asyncio.gather(*list(_iot_action_tasks), return_exceptions=True)
+    await cloud_bridge.stop()
+    await device_manager.shutdown()
+    if scale_service is not None:
+        scale_service._stop_monitor()
+    task = getattr(app.state, "spool_cleanup_task", None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    cloud_task = getattr(app.state, "cloud_bridge_task", None)
+    if cloud_task:
+        cloud_task.cancel()
+        try:
+            await cloud_task
+        except asyncio.CancelledError:
+            pass
+
+
+class JsonRpcRequest(BaseModel):
+    jsonrpc: str | None = "2.0"
+    method: str | None = None
+    params: dict[str, Any] = Field(default_factory=dict)
+    id: str | int | None = None
+
+
+def rpc_ok(result: Any, rpc_id: str | int | None) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": rpc_id, "result": result}
+
+
+def rpc_error(message: str, rpc_id: str | int | None, code: int = -32000) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": rpc_id, "error": {"code": code, "message": message}}
+
+
+def _track_iot_action_task(task: asyncio.Task[None]) -> None:
+    _iot_action_tasks.add(task)
+    task.add_done_callback(_iot_action_tasks.discard)
+    _logger.info("IOT background task tracked pending_tasks=%s", len(_iot_action_tasks))
+
+
+async def _execute_iot_action_background(session_id: str, device_identifier: str, data: dict[str, Any]) -> None:
+    started_at = asyncio.get_running_loop().time()
+    action = str(data.get("action") or "")
+    has_receipt = "yes" if data.get("receipt") else "no"
+    _logger.info(
+        "IOT background action start session_id=%s device_identifier=%s action=%s has_receipt=%s pending_tasks=%s",
+        session_id,
+        device_identifier,
+        action or "<none>",
+        has_receipt,
+        len(_iot_action_tasks),
+    )
+    _logger.debug(
+        "IOT background action data session_id=%s device_identifier=%s action=%s data_keys=%s",
+        session_id,
+        device_identifier,
+        action,
+        sorted(data.keys()),
+    )
+    try:
+        success = await device_manager.execute(session_id, device_identifier, data)
+    except Exception as exc:
+        success = False
+        dev_log(
+            "iot_background_exception",
+            session_id=session_id,
+            device_identifier=device_identifier,
+            action=action,
+        )
+        _logger.exception(
+            "IOT background action failed session_id=%s device_identifier=%s action=%s error_type=%s error=%s",
+            session_id,
+            device_identifier,
+            action or "<none>",
+            type(exc).__name__,
+            str(exc),
+        )
+    if not success:
+        _logger.warning(
+            "IOT background action returned failure session_id=%s device_identifier=%s action=%s duration_ms=%.1f",
+            session_id,
+            device_identifier,
+            action or "<none>",
+            (asyncio.get_running_loop().time() - started_at) * 1000,
+        )
+        await event_bus.publish(
+            IoTEvent(
+                device_identifier=device_identifier,
+                owner=session_id,
+                status="error",
+                message="ERROR_PRINTER",
+                result={"mode": action or "unknown"},
+            )
+        )
+    _logger.info(
+        "IOT background action done session_id=%s device_identifier=%s action=%s success=%s duration_ms=%.1f pending_tasks=%s",
+        session_id,
+        device_identifier,
+        action or "<none>",
+        success,
+        (asyncio.get_running_loop().time() - started_at) * 1000,
+        len(_iot_action_tasks),
+    )
+    dev_log(
+        "iot_background_done",
+        session_id=session_id,
+        device_identifier=device_identifier,
+        action=action,
+        success=success,
+        duration_ms=round((asyncio.get_running_loop().time() - started_at) * 1000, 1),
+        pending_tasks=len(_iot_action_tasks),
+    )
+
+
+
+@app.get("/", response_class=FileResponse)
+async def homepage() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
+
+
+
+@app.post("/iot_drivers/action")
+async def iot_action(request: JsonRpcRequest) -> dict[str, Any]:
+    params = request.params
+    session_id = str(params.get("session_id", ""))
+    device_identifier = str(params.get("device_identifier", ""))
+    data = params.get("data") or {}
+    if not isinstance(data, dict):
+        return rpc_error("Invalid action data", request.id, code=-32602)
+    action = str(data.get("action") or "")
+    _perf_log(
+        "IOT action "
+        f"session_id={session_id or '<missing>'} "
+        f"device_identifier={device_identifier or '<missing>'} "
+        f"action={action or '<none>'} "
+        f"keys={sorted(data.keys()) if isinstance(data, dict) else '<non-dict>'} "
+        f"data={data if isinstance(data, dict) else '<non-dict>'}"
+    )
+
+    _logger.info(
+        "IOT action request session_id=%s device_identifier=%s action=%s keys=%s",
+        session_id or "<missing>",
+        device_identifier or "<missing>",
+        action or "<none>",
+        sorted(data.keys()) if isinstance(data, dict) else "<non-dict>",
+    )
+    dev_log(
+        "iot_action_request",
+        rpc_id=request.id,
+        session_id=session_id,
+        device_identifier=device_identifier,
+        action=action,
+        action_summary=summarize_action(data),
+    )
+
+    if not session_id or not device_identifier:
+        dev_log(
+            "iot_action_rejected",
+            reason="missing identifiers",
+            rpc_id=request.id,
+            session_id=session_id,
+            device_identifier=device_identifier,
+            action=action,
+        )
+        _logger.warning(
+            "IOT action rejected due to missing identifiers session_id=%s device_identifier=%s",
+            session_id or "<missing>",
+            device_identifier or "<missing>",
+        )
+        return rpc_error("Missing session_id or device_identifier", request.id, code=-32602)
+
+    if action in _PRINT_ACTIONS:
+        task = asyncio.create_task(_execute_iot_action_background(session_id, device_identifier, dict(data)))
+        _track_iot_action_task(task)
+        _logger.info(
+            "IOT action queued session_id=%s device_identifier=%s action=%s pending_tasks=%s",
+            session_id,
+            device_identifier,
+            action or "<none>",
+            len(_iot_action_tasks),
+        )
+        dev_log(
+            "iot_action_queued",
+            rpc_id=request.id,
+            session_id=session_id,
+            device_identifier=device_identifier,
+            action=action,
+            pending_tasks=len(_iot_action_tasks),
+        )
+        return rpc_ok(True, request.id)
+
+    # Odoo 19 POS IoT 协议：电子秤 action 通过 /iot_drivers/action 调用
+    # action ∈ {read_once, start_reading, stop_reading}，action 只返回 True，
+    # 重量通过 EventBus 事件推送（/iot_drivers/event 长轮询获取）。
+    # 事件 result 是直接数字（非 {"value": x} 对象），遵循 serial_scale_driver.py 协议。
+    # 关键：Odoo 19 controller 把 session_id 加到 data 中，Driver.action 设置
+    # self.data["owner"] = session_id，后续事件中 owner = session_id，
+    # POS 的 onMessage 检查 message.owner === requestId 才会处理事件。
+    if scale_service is not None and action in {"read_once", "start_reading", "stop_reading", "read"}:
+        target = device_manager.devices.get(device_identifier)
+        is_scale = (
+            (target is not None and getattr(target, "type", "") == "scale")
+            or "scale" in device_identifier.lower()
+        )
+        if is_scale:
+            try:
+                # 设置 owner = session_id，后续 ScaleMonitor 发布事件时使用此 owner
+                # 对应 Odoo 19 driver.py: self.data["owner"] = session_id
+                scale_service.set_owner(session_id)
+                # 先读一次重量并立即发布事件（此时 ScaleMonitor 还没启动，串口可用）
+                # 这样 POS 能立即收到重量响应，不需要等 ScaleMonitor 启动
+                if action in {"read_once", "read"}:
+                    weight = scale_service.read_hw_proxy_scale()
+                    if weight is not None:
+                        scale_service.publish_weight_event(weight)
+                # 然后启动 ScaleMonitor 按需持续读取（每 0.25 秒 probe 一次）
+                # 重量变化时自动通过 EventBus 推送给 POS
+                scale_service.touch_action()
+                _logger.info(
+                    "IOT scale action session_id=%s device_identifier=%s action=%s owner=%s",
+                    session_id, device_identifier, action, session_id,
+                )
+                dev_log(
+                    "iot_action_scale",
+                    rpc_id=request.id,
+                    session_id=session_id,
+                    device_identifier=device_identifier,
+                    action=action,
+                )
+                # Odoo 19 action 只返回 True，重量数据通过事件推送
+                return rpc_ok(True, request.id)
+            except Exception as exc:
+                _logger.exception("IOT scale action failed: %s", exc)
+                return rpc_error(f"Scale action failed: {exc}", request.id)
+
+    success = await device_manager.execute(session_id, device_identifier, data)
+    _logger.info(
+        "IOT action result session_id=%s device_identifier=%s action=%s success=%s",
+        session_id,
+        device_identifier,
+        action or "<none>",
+        success,
+    )
+    dev_log(
+        "iot_action_done",
+        rpc_id=request.id,
+        session_id=session_id,
+        device_identifier=device_identifier,
+        action=action,
+        success=success,
+    )
+    return rpc_ok(success, request.id)
+
+
+@app.post("/iot_drivers/event")
+async def iot_event(request: JsonRpcRequest) -> dict[str, Any]:
+    listener = request.params.get("listener")
+    if not isinstance(listener, dict):
+        _logger.warning("IOT event poll rejected because listener parameter is missing or invalid")
+        return rpc_error("Missing listener parameter", request.id, code=-32602)
+
+    _perf_log(f"IOT event poll listener={listener}")
+    event = await event_bus.poll(listener, timeout_seconds=50)
+    if event:
+        _perf_log(f"IOT event result event={event}")
+        _logger.info(
+            "IOT event delivered session_id=%s device_identifier=%s owner=%s status=%s",
+            listener.get("session_id", ""),
+            event.get("device_identifier", ""),
+            event.get("owner", ""),
+            event.get("status", ""),
+        )
+    else:
+        _perf_log("IOT event result event=<timeout>")
+        _logger.info("IOT event poll timeout session_id=%s", listener.get("session_id", ""))
+    dev_log(
+        "iot_event_poll_result",
+        rpc_id=request.id,
+        session_id=listener.get("session_id", ""),
+        listener_devices=list((listener.get("devices") or {}).keys()) if isinstance(listener.get("devices"), dict) else listener.get("devices"),
+        event_status=event.get("status") if isinstance(event, dict) else None,
+        event_device=event.get("device_identifier") if isinstance(event, dict) else None,
+        event_owner=event.get("owner") if isinstance(event, dict) else None,
+    )
+    return rpc_ok(event, request.id)
+
+
+@app.get("/api/status")
+async def api_status() -> dict[str, Any]:
+    server_connection = config_store.get_connection()
+    certificates = certificate_manager.status()
+    certificates["startup_error"] = getattr(app.state, "certificate_error", "")
+    devices = device_manager.device_list()
+    cloud_status = cloud_bridge.status()
+    dev_log(
+        "api_status",
+        iot_identifier=IOT_IDENTIFIER,
+        server_url=server_connection.get("url", ""),
+        connected=server_connection.get("connected", False),
+        iot_channel=server_connection.get("iot_channel", ""),
+        cloud_bridge=cloud_status if IOT_ENABLE_CLOUD_BRIDGE else {"enabled": False},
+        device_count=len(devices),
+        device_identifiers=[device.get("identifier") for device in devices],
+    )
+    return {
+        "status": "success",
+        "mode": "cloud",
+        "iot": {
+            "identifier": IOT_IDENTIFIER,
+            "ip": IOT_IP,
+            "version": IOT_VERSION,
+        },
+        "server_connection": server_connection,
+        "local_config": config_store.get_local_config(),
+        "cloud_bridge": cloud_status
+        if IOT_ENABLE_CLOUD_BRIDGE
+        else {
+            "enabled": False,
+            "connected": False,
+            "server_url": server_connection.get("url", ""),
+            "iot_channel": server_connection.get("iot_channel", ""),
+            "last_error": "Disabled",
+            "ssl_verify": IOT_SSL_VERIFY,
+        },
+        "certificates": certificates,
+        "devices": devices,
+    }
+
+
+def _legacy_iot_status_payload() -> dict[str, Any]:
+    local_config = config_store.get_local_config()
+    return {
+        "status": "connected",
+        "iot_box": {
+            "identifier": IOT_IDENTIFIER,
+            "name": IOT_IDENTIFIER,
+            "ip": IOT_IP,
+            "version": IOT_VERSION,
+            "ssl_engine": local_config.get("ssl_engine", "plain_http"),
+            "local_url": local_config.get("local_url", ""),
+        },
+        "devices": device_manager.device_list(),
+        "drivers": _build_drivers_object(),
+    }
+
+
+@app.get("/hw_proxy/hello")
+async def hw_proxy_hello_get() -> str:
+    return "ping"
+
+
+@app.post("/hw_proxy/hello")
+async def hw_proxy_hello_post(request: JsonRpcRequest | None = None) -> dict[str, Any]:
+    return rpc_ok("ping", request.id if request else None)
+
+
+@app.post("/hw_proxy/scale_read")
+async def hw_proxy_scale_read(request: JsonRpcRequest | None = None) -> dict[str, Any]:
+    """Odoo POS 标准电子秤读取端点。
+
+    POS 在称重界面按 ~500ms 间隔轮询此端点。ScaleMonitor 后台线程
+    持续读取并更新缓存，这里优先返回新鲜缓存（<1s），缓存失效时
+    才触发一次直接串口读取，保证 POS 响应快且不阻塞。
+    """
+    rpc_id = request.id if request else None
+    if scale_service is None:
+        return rpc_error("Scale service not available", rpc_id)
+    try:
+        weight = scale_service.read_hw_proxy_scale()
+    except Exception as exc:
+        _logger.exception("hw_proxy/scale_read failed: %s", exc)
+        return rpc_error(f"Scale read failed: {exc}", rpc_id)
+    if weight is None:
+        return rpc_ok({"weight": 0.0, "unit": "kg", "info": "no_reading"}, rpc_id)
+    return rpc_ok({"weight": round(weight, 3), "unit": "kg", "info": "ok"}, rpc_id)
+
+
+@app.post("/hw_proxy/scale_zero")
+async def hw_proxy_scale_zero(request: JsonRpcRequest | None = None) -> dict[str, Any]:
+    """Odoo POS 标准电子秤去皮/归零端点（占位实现）。
+
+    ZFOC/Epelsa 协议的去皮命令需根据具体型号适配，此处先返回成功
+    占位，避免 POS 调用时 404。
+    """
+    rpc_id = request.id if request else None
+    # TODO: 根据 scale_brand 发送对应去皮命令
+    return rpc_ok({"success": True, "info": "scale_zero_not_implemented"}, rpc_id)
+
+
+@app.get("/hw_proxy/status_json")
+@app.get("/iot/box")
+@app.get("/iot/box/status")
+async def legacy_iot_status_get() -> dict[str, Any]:
+    return _legacy_iot_status_payload()
+
+
+@app.post("/hw_proxy/status_json")
+async def legacy_iot_status_post(request: Request) -> dict[str, Any]:
+    """
+    Odoo POS keepAlive() calls rpc(POST) to this endpoint and expects
+    the JSON-RPC result to be a drivers object:
+      { printer: {status: "connected"}, scanner: {status: "..."}, scale: {status: "..."} }
+    NOT the full status payload.
+    """
+    drivers = _build_drivers_object()
+    try:
+        body = await request.json()
+        rpc_id = body.get("id") if isinstance(body, dict) else None
+    except Exception:
+        rpc_id = None
+    return rpc_ok(drivers, rpc_id)
+
+
+@app.post("/iot/box")
+@app.post("/iot/box/status")
+async def legacy_iot_box_status_post(request: Request) -> dict[str, Any]:
+    payload = _legacy_iot_status_payload()
+    try:
+        body = await request.json()
+        rpc_id = body.get("id") if isinstance(body, dict) else None
+    except Exception:
+        rpc_id = None
+    return rpc_ok(payload, rpc_id)
+
+
+def _build_drivers_object() -> dict[str, dict[str, str]]:
+    """Build the drivers object that Odoo POS keepAlive() expects."""
+    devices = device_manager.device_list()
+    drivers: dict[str, dict[str, str]] = {}
+    for device in devices:
+        dtype = str(device.get("device_type") or device.get("type") or "").strip()
+        if dtype and dtype not in drivers:
+            drivers[dtype] = {"status": str(device.get("status") or "disconnected")}
+    for expected_type in ("printer", "scanner", "scale"):
+        if expected_type not in drivers:
+            drivers[expected_type] = {"status": "disconnected"}
+    return drivers
+
+
+async def _read_legacy_request_payload(request: Request) -> dict[str, Any]:
+    try:
+        payload = await request.json()
+    except Exception:
+        body = await request.body()
+        text = body.decode("utf-8", errors="replace").strip()
+        payload = {"receipt": text} if text else {}
+    return payload if isinstance(payload, dict) else {"payload": payload}
+
+
+def _legacy_rpc_id(payload: dict[str, Any]) -> str | int | None:
+    return payload.get("id")
+
+
+def _legacy_params(payload: dict[str, Any]) -> dict[str, Any]:
+    params = payload.get("params")
+    if isinstance(params, dict):
+        return params
+    return payload
+
+
+def _legacy_receipt_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    params = _legacy_params(payload)
+    raw_receipt = (
+        params.get("receipt")
+        or params.get("xml")
+        or params.get("data")
+        or payload.get("receipt")
+        or payload.get("xml")
+        or payload.get("data")
+    )
+    if isinstance(raw_receipt, dict):
+        return raw_receipt
+    if isinstance(raw_receipt, list):
+        return {"lines": raw_receipt}
+    if isinstance(raw_receipt, str):
+        return {"lines": _legacy_xml_or_text_lines(raw_receipt)}
+    return {}
+
+
+def _legacy_xml_or_text_lines(raw_receipt: str) -> list[dict[str, Any]]:
+    text = str(raw_receipt or "").strip()
+    if not text:
+        return []
+    if text.startswith("<"):
+        try:
+            root = ET.fromstring(text)
+            lines: list[dict[str, Any]] = []
+            _append_legacy_xml_lines(root, lines)
+            if lines:
+                return lines
+        except ET.ParseError:
+            pass
+    return [
+        {"text": line.strip(), "align": "left", "bold": False, "classes": []}
+        for line in text.splitlines()
+        if line.strip()
+    ]
+
+
+def _append_legacy_xml_lines(node: ET.Element, lines: list[dict[str, Any]], inherited: dict[str, Any] | None = None) -> None:
+    inherited = dict(inherited or {})
+    tag = node.tag.rsplit("}", 1)[-1].lower()
+    style = dict(inherited)
+    if tag in {"center", "div", "p"} and str(node.attrib.get("align") or "").lower() == "center":
+        style["align"] = "center"
+    if tag == "center":
+        style["align"] = "center"
+    if tag in {"right"}:
+        style["align"] = "right"
+    if tag in {"b", "strong", "bold"}:
+        style["bold"] = True
+    if tag in {"h1", "h2"}:
+        style["bold"] = True
+        style["double_width"] = True
+        style["double_height"] = True
+
+    pieces: list[str] = []
+    if node.text and node.text.strip():
+        pieces.append(node.text.strip())
+    for child in list(node):
+        _append_legacy_xml_lines(child, lines, style)
+        if child.tail and child.tail.strip():
+            pieces.append(child.tail.strip())
+    if pieces and tag not in {"receipt", "root", "table", "tbody", "thead", "tr"}:
+        lines.append(
+            {
+                "text": " ".join(pieces),
+                "align": style.get("align", "left"),
+                "bold": bool(style.get("bold")),
+                "double_width": bool(style.get("double_width")),
+                "double_height": bool(style.get("double_height")),
+                "classes": [],
+            }
+        )
+
+
+async def _legacy_print(request: Request, *, action: str) -> dict[str, Any]:
+    payload = await _read_legacy_request_payload(request)
+    params = _legacy_params(payload)
+    device_identifier = str(
+        params.get("device_identifier")
+        or params.get("printer_identifier")
+        or config_store.get_local_config().get("printer_identifier")
+        or "printer_main"
+    )
+    session_id = str(_legacy_rpc_id(payload) or params.get("session_id") or f"legacy-{int(asyncio.get_running_loop().time() * 1000)}")
+    if action == "cashbox":
+        data = {"action": "cashbox"}
+    else:
+        data = {"action": "print_receipt_escpos", "receipt": _legacy_receipt_payload(payload)}
+    dev_log(
+        "legacy_hw_proxy_print_request",
+        rpc_id=_legacy_rpc_id(payload),
+        session_id=session_id,
+        device_identifier=device_identifier,
+        action=data.get("action"),
+        payload_keys=sorted(payload.keys()),
+        params_keys=sorted(params.keys()),
+        action_summary=summarize_action(data),
+    )
+    success = await device_manager.execute(session_id, device_identifier, data)
+    dev_log(
+        "legacy_hw_proxy_print_result",
+        rpc_id=_legacy_rpc_id(payload),
+        session_id=session_id,
+        device_identifier=device_identifier,
+        action=data.get("action"),
+        success=success,
+    )
+    return rpc_ok(bool(success), _legacy_rpc_id(payload))
+
+
+@app.post("/hw_proxy/default_printer_action")
+async def hw_proxy_default_printer_action(request: Request) -> dict[str, Any]:
+    """
+    Odoo POS HWPrinter calls this endpoint via rpc() with:
+      params: { data: { action: "print_receipt"|"cashbox", receipt: ..., ... } }
+    Returns JSON-RPC response with the print result.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    params = body.get("params") if isinstance(body, dict) else {}
+    data = params.get("data") if isinstance(params, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    action = str(data.get("action") or "")
+    rpc_id = body.get("id") if isinstance(body, dict) else None
+
+    if action == "cashbox":
+        data = {"action": "cashbox"}
+    else:
+        # Check if the receipt is a native canvas image from HWPrinter.
+        # HWPrinter renders the HTML receipt to a canvas and sends the
+        # data URL directly as: { action: "print_receipt", receipt: "data:image/..." }.
+        # In this case we MUST pass the image through the native print path
+        # (_print_receipt_native_image) rather than parsing the data URL as
+        # ESC/POS text lines via _legacy_receipt_payload().
+        raw_receipt = data.get("receipt") or ""
+        if isinstance(raw_receipt, str) and (
+            raw_receipt.strip().startswith("data:image/")
+            or raw_receipt.strip().startswith("http://")
+            or raw_receipt.strip().startswith("https://")
+        ):
+            # Pass through as native image print_receipt action
+            data = {"action": "print_receipt", "receipt": raw_receipt.strip()}
+        else:
+            data = {"action": "print_receipt_escpos", "receipt": _legacy_receipt_payload(data)}
+
+    session_id = str(
+        data.get("session_id")
+        or params.get("session_id")
+        or config_store.get_local_config().get("printer_identifier")
+        or f"hwproxy-{int(asyncio.get_running_loop().time() * 1000)}"
+    )
+    device_identifier = str(
+        data.get("device_identifier")
+        or data.get("printer_identifier")
+        or config_store.get_local_config().get("printer_identifier")
+        or "printer_main"
+    )
+
+    dev_log(
+        "hw_proxy_default_printer_action",
+        rpc_id=rpc_id,
+        session_id=session_id,
+        device_identifier=device_identifier,
+        action=data.get("action"),
+        data_keys=sorted(data.keys()),
+    )
+    success = await device_manager.execute(session_id, device_identifier, data)
+    return rpc_ok(bool(success), rpc_id)
+
+
+@app.post("/hw_proxy/print_xml_receipt")
+@app.post("/hw_proxy/print_receipt")
+@app.post("/hw_proxy/print_receipt_escpos")
+async def legacy_hw_proxy_print_receipt(request: Request) -> dict[str, Any]:
+    return await _legacy_print(request, action="print_receipt_escpos")
+
+
+@app.post("/hw_proxy/open_cashbox")
+@app.post("/hw_proxy/open_cashbox_direct")
+async def legacy_hw_proxy_open_cashbox(request: Request) -> dict[str, Any]:
+    return await _legacy_print(request, action="cashbox")
+
+
+
+@app.get("/api/cert/crt", response_class=FileResponse)
+async def api_cert_crt() -> FileResponse:
+    try:
+        certificate_manager.ensure()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Certificate unavailable: {exc}") from exc
+    return FileResponse(certificate_manager.crt_path, filename="iotbox.crt", media_type="application/x-x509-ca-cert")
+
+
+@app.get("/api/cert/p12", response_class=FileResponse)
+async def api_cert_p12() -> FileResponse:
+    try:
+        certificate_manager.ensure()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"Certificate unavailable: {exc}") from exc
+    return FileResponse(certificate_manager.p12_path, filename="iotbox.p12", media_type="application/x-pkcs12")
+
+
+@app.post("/iot_drivers/connect_to_server")
+async def connect_to_server(request: JsonRpcRequest) -> dict[str, Any]:
+    token = str(request.params.get("token", "")).strip()
+    if not token:
+        return rpc_error("Missing token", request.id, code=-32602)
+    try:
+        connection = config_store.connect_from_token_url(token)
+    except ValueError as exc:
+        return rpc_ok({"status": "failure", "message": str(exc)}, request.id)
+    sync = odoo_sync.sync_setup(
+        server_url=connection.get("url", ""),
+        token=connection.get("token", ""),
+        identifier=IOT_IDENTIFIER,
+        ip=IOT_IP,
+        version=IOT_VERSION,
+        devices=device_manager.as_odoo_devices_payload(),
+    )
+    config_store.set_sync_status(sync.ok, sync.message)
+    if sync.ok and sync.iot_channel:
+        config_store.update_connection(iot_channel=sync.iot_channel)
+    if not sync.ok:
+        config_store.reset_connection(message=sync.message)
+    elif IOT_ENABLE_CLOUD_BRIDGE:
+        await cloud_bridge.request_reconnect(message="Odoo connection updated from /iot_drivers/connect_to_server")
+    dev_log(
+        "iot_connect_to_server",
+        rpc_id=request.id,
+        server_url=connection.get("url", ""),
+        db_name=connection.get("db_name", ""),
+        db_uuid=connection.get("db_uuid", ""),
+        sync_ok=sync.ok,
+        sync_message=sync.message,
+        iot_channel=sync.iot_channel or connection.get("iot_channel", ""),
+        devices=device_manager.as_odoo_devices_payload(),
+    )
+
+    return rpc_ok(
+        {
+            "status": "success" if sync.ok else "failure",
+            "message": sync.message,
+        },
+        request.id,
+    )
+
+
+@app.post("/api/connect")
+async def api_connect(payload: dict[str, Any]) -> dict[str, Any]:
+    token_url = str(payload.get("token_url", "")).strip()
+    if not token_url:
+        raise HTTPException(status_code=400, detail="token_url is required")
+    try:
+        connection = config_store.connect_from_token_url(token_url)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    sync = odoo_sync.sync_setup(
+        server_url=connection.get("url", ""),
+        token=connection.get("token", ""),
+        identifier=IOT_IDENTIFIER,
+        ip=IOT_IP,
+        version=IOT_VERSION,
+        devices=device_manager.as_odoo_devices_payload(),
+    )
+    config_store.set_sync_status(sync.ok, sync.message)
+    if sync.ok and sync.iot_channel:
+        config_store.update_connection(iot_channel=sync.iot_channel)
+    if not sync.ok:
+        config_store.reset_connection(message=sync.message)
+        dev_log(
+            "api_connect_failed",
+            server_url=connection.get("url", ""),
+            db_name=connection.get("db_name", ""),
+            db_uuid=connection.get("db_uuid", ""),
+            sync_message=sync.message,
+        )
+        raise HTTPException(status_code=502, detail=sync.message)
+    dev_log(
+        "api_connect_success",
+        server_url=connection.get("url", ""),
+        db_name=connection.get("db_name", ""),
+        db_uuid=connection.get("db_uuid", ""),
+        sync_message=sync.message,
+        iot_channel=sync.iot_channel or connection.get("iot_channel", ""),
+        devices=device_manager.as_odoo_devices_payload(),
+    )
+    if IOT_ENABLE_CLOUD_BRIDGE:
+        await cloud_bridge.request_reconnect(message="Odoo connection updated from /api/connect")
+    return {"status": "success", "server_connection": connection}
+
+
+@app.post("/api/disconnect")
+async def api_disconnect() -> dict[str, Any]:
+    connection = await cloud_bridge.disconnect(message="Disconnected from Odoo. Ready to pair a new server.")
+    dev_log("api_disconnect", message=connection.get("last_sync_message", ""))
+    return {"status": "success", "server_connection": connection}
+
+
+@app.post("/api/settings")
+async def api_settings(payload: dict[str, Any]) -> dict[str, Any]:
+    ssl_engine = str(payload.get("ssl_engine", "secure_https")).strip() or "secure_https"
+    local_url = str(payload.get("local_url", "")).strip()
+    update_fields: dict[str, Any] = {
+        "ssl_engine": ssl_engine,
+        "local_url": local_url,
+    }
+    if "printer_identifier" in payload:
+        update_fields["printer_identifier"] = str(payload.get("printer_identifier", "")).strip()
+    if "primary_printer_queue" in payload:
+        update_fields["primary_printer_queue"] = str(payload.get("primary_printer_queue", "")).strip()
+    if "enabled_printer_queues" in payload:
+        raw_enabled_printer_queues = payload.get("enabled_printer_queues") or []
+        if isinstance(raw_enabled_printer_queues, str):
+            enabled_printer_queues = [item.strip() for item in raw_enabled_printer_queues.splitlines() if item.strip()]
+        else:
+            enabled_printer_queues = [
+                str(item).strip() for item in raw_enabled_printer_queues
+                if str(item).strip()
+            ]
+        update_fields["enabled_printer_queues"] = enabled_printer_queues
+    config = config_store.update_local_config(**update_fields)
+    device_manager.refresh_local_hardware()
+    connection = config_store.get_connection()
+    sync_message = ""
+    if connection.get("connected") and connection.get("url") and connection.get("token"):
+        sync = await asyncio.to_thread(
+            odoo_sync.sync_setup,
+            server_url=connection.get("url", ""),
+            token=connection.get("token", ""),
+            identifier=IOT_IDENTIFIER,
+            ip=IOT_IP,
+            version=IOT_VERSION,
+            devices=device_manager.as_odoo_devices_payload(),
+        )
+        config_store.set_sync_status(sync.ok, sync.message)
+        if sync.ok and sync.iot_channel:
+            config_store.update_connection(iot_channel=sync.iot_channel)
+        sync_message = sync.message
+        if IOT_ENABLE_CLOUD_BRIDGE and sync.ok:
+            await cloud_bridge.request_reconnect(message="Local settings synced; reconnecting cloud bridge")
+    dev_log(
+        "api_settings_saved",
+        update_fields=update_fields,
+        sync_message=sync_message,
+        devices=device_manager.device_list(),
+        connection=config_store.get_connection(),
+    )
+    return {"status": "success", "local_config": config, "sync_message": sync_message}
+
+
+
+@app.get("/api/devices")
+async def api_devices() -> dict[str, Any]:
+    return {"devices": device_manager.device_list()}
+
+
+@app.get("/api/scale/config")
+async def api_scale_config() -> dict[str, Any]:
+    config = config_store.get_local_config()
+    return {
+        "port": str(config.get("scale_port") or ""),
+        "baudrate": int(config.get("scale_baudrate") or 9600),
+        "timeout": float(config.get("scale_timeout") or 1.2),
+        "brand": str(config.get("scale_brand") or "zfoc"),
+        "inter_command_delay": float(config.get("scale_inter_command_delay") or 0.05),
+        "sse_enabled": bool(config.get("scale_sse_enabled", False)),
+        "is_monitor_running": scale_service.is_monitor_running if scale_service else False,
+    }
+
+
+@app.get("/api/scale/weight")
+async def api_scale_weight() -> dict[str, Any]:
+    if scale_service is None:
+        return {"status": "error", "message": "Scale service not available"}
+    try:
+        weight = scale_service.read_weight()
+        if weight is None:
+            return {"status": "no_weight", "message": "No weight reading available"}
+        return {"status": "success", "weight_kg": weight, "unit": "kg"}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+@app.get("/api/scale/weight_cached")
+async def api_scale_weight_cached() -> dict[str, Any]:
+    if scale_service is None:
+        return {"status": "error", "message": "Scale service not available"}
+    weight = scale_service.get_cached_weight()
+    if weight is None:
+        return {"status": "no_weight", "message": "No cached weight"}
+    return {"status": "success", "weight_kg": weight, "unit": "kg"}
+
+
+@app.post("/api/scale/refresh")
+async def api_scale_refresh() -> dict[str, Any]:
+    if scale_service is None:
+        return {"status": "error", "message": "Scale service not available"}
+    # 按需读取模式：不自动启动监控，只刷新配置
+    # 监控会在 POS 打开称重界面（调用 read_once action）时自动启动
+    return {"status": "success", "is_running": scale_service.is_monitor_running, "mode": "on_demand"}
+
+
+@app.post("/api/scale/prime")
+async def api_scale_prime() -> dict[str, Any]:
+    if scale_service is None:
+        return {"status": "error", "message": "Scale service not available"}
+    scale_service.prime_monitor()
+    weight = scale_service.get_cached_weight()
+    return {
+        "status": "success",
+        "is_running": scale_service.is_monitor_running,
+        "initial_weight": weight,
+    }
+
+
+@app.get("/api/scale/ports")
+async def api_scale_ports() -> dict[str, Any]:
+    try:
+        from .serial_utils import list_serial_ports
+        ports = list_serial_ports()
+        return {"status": "success", "ports": ports}
+    except Exception as exc:
+        return {"status": "error", "message": str(exc)}
+
+
+@app.get("/api/scale/stream")
+async def api_scale_stream(request: Request) -> Any:
+    """SSE 端点：电子秤重量变化时实时推送给前端。
+
+    前端使用 ``new EventSource('/api/scale/stream')`` 订阅。
+    每当 ScaleMonitor 读到新重量且变化超过阈值时，推送一条 ``data:`` 事件。
+    无变化时每 15 秒发送心跳注释行保活。
+    """
+    if scale_service is None:
+        return {"status": "error", "message": "Scale service not available"}
+
+    queue = scale_service.subscribe()
+
+    async def event_generator():
+        try:
+            # 连接建立后立即推送一次当前缓存值（若存在），避免前端长时间空白
+            cached = scale_service.get_cached_weight(max_age=30.0)
+            if cached is not None:
+                initial_payload = {
+                    "status": "success",
+                    "weight_kg": round(cached, 3),
+                    "unit": "kg",
+                    "timestamp": time.time(),
+                    "stable": False,
+                }
+                yield f"data: {json.dumps(initial_payload, ensure_ascii=False)}\n\n"
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    payload = await asyncio.wait_for(queue.get(), timeout=15.0)
+                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                except asyncio.TimeoutError:
+                    # SSE 心跳注释行，防止代理/浏览器超时断开
+                    yield ": heartbeat\n\n"
+        finally:
+            scale_service.unsubscribe(queue)
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/api/scale/save_config")
+async def api_scale_save_config(payload: dict[str, Any]) -> dict[str, Any]:
+    update_fields: dict[str, Any] = {}
+    if "scale_port" in payload:
+        update_fields["scale_port"] = str(payload.get("scale_port", "")).strip()
+    if "scale_baudrate" in payload:
+        update_fields["scale_baudrate"] = int(payload.get("scale_baudrate", 9600))
+    if "scale_timeout" in payload:
+        update_fields["scale_timeout"] = float(payload.get("scale_timeout", 1.2))
+    if "scale_brand" in payload:
+        update_fields["scale_brand"] = str(payload.get("scale_brand", "zfoc")).strip().lower()
+    if "scale_inter_command_delay" in payload:
+        update_fields["scale_inter_command_delay"] = float(payload.get("scale_inter_command_delay", 0.05))
+    if "scale_sse_enabled" in payload:
+        update_fields["scale_sse_enabled"] = bool(payload.get("scale_sse_enabled", False))
+    config = config_store.update_local_config(**update_fields)
+    # 按需读取模式：保存配置后不自动启动监控
+    # 监控会在 POS 打开称重界面（调用 read_once action）时自动启动
+    return {"status": "success", "local_config": config}

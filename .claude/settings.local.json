@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tasklist //FI \"PID eq 12652\")",
+      "Bash(curl -k --connect-timeout 3 https://127.0.0.1:8398/health)",
+      "Bash(curl -k --connect-timeout 3 https://127.0.0.1:8398/api/health)",
+      "Bash(curl -k --connect-timeout 3 https://127.0.0.1:8398/)",
+      "Bash(netstat -ano)",
+      "Bash(echo \"port 8389 status: $?\")",
+      "Bash(\"C:/Users/PC/AppData/Local/Programs/Python/Python314/python.exe\" -c \"import uvicorn; import fastapi; print\\('uvicorn:', uvicorn.__version__\\); print\\('fastapi:', fastapi.__version__\\)\")",
+      "Bash(IOT_PORT=8389 nohup \"C:/Users/PC/AppData/Local/Programs/Python/Python314/python.exe\" run_https.py)",
+      "Bash(echo \"HTTPS server PID: $!\")",
+      "Bash(curl -k --connect-timeout 5 https://127.0.0.1:8389/)"
+    ]
+  }
+}
