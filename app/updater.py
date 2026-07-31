@@ -199,9 +199,10 @@ class GitHubUpdateSource(UpdateSource):
             tag = str(release.get("tag_name", "")).lstrip("vV")
             if not tag:
                 continue
+
+            # 优先使用上传的 assets（.zip 文件）
             assets = release.get("assets") or []
             download_url = ""
-            checksum = ""
             file_size = 0
             for asset in assets:
                 if not isinstance(asset, dict):
@@ -210,18 +211,23 @@ class GitHubUpdateSource(UpdateSource):
                 if name.endswith(".zip"):
                     download_url = str(asset.get("browser_download_url", ""))
                     file_size = int(asset.get("size", 0))
+                    break
             if not download_url and assets:
                 first = assets[0]
                 if isinstance(first, dict):
                     download_url = str(first.get("browser_download_url", ""))
                     file_size = int(first.get("size", 0))
 
+            # 如果没有上传 assets，回退到 GitHub 自动生成的源码 zip
+            if not download_url:
+                download_url = str(release.get("zipball_url", ""))
+
             return VersionInfo({
                 "version": tag,
                 "release_date": str(release.get("published_at", "")),
                 "changelog": str(release.get("body", "")),
                 "download_url": download_url,
-                "checksum": checksum,
+                "checksum": "",
                 "file_size": file_size,
             })
         return None
@@ -367,12 +373,12 @@ class UpdateManager:
             backup_path = self._create_backup()
             _logger.info("已备份到: %s", backup_path)
 
-            # 2. 解压到临时目录
+            # 2. 解压到临时目录（自动处理 GitHub 嵌套目录）
             extract_dir = Path(tempfile.mkdtemp(prefix="iot_box_extract_"))
-            self._extract(package_path, extract_dir)
+            effective_dir = self._extract(package_path, extract_dir)
 
             # 3. 覆盖文件（排除运行时配置文件）
-            self._apply_files(extract_dir)
+            self._apply_files(effective_dir)
 
             # 4. 清理
             shutil.rmtree(extract_dir, ignore_errors=True)
@@ -449,14 +455,20 @@ class UpdateManager:
                 result.append(item)
         return result
 
-    def _extract(self, package_path: Path, dest: Path) -> None:
-        """解压更新包"""
+    def _extract(self, package_path: Path, dest: Path) -> Path:
+        """解压更新包，返回有效的源目录（处理 GitHub 自动生成的嵌套目录）"""
         dest.mkdir(parents=True, exist_ok=True)
         if package_path.suffix.lower() == ".zip":
             with zipfile.ZipFile(package_path, "r") as zf:
                 zf.extractall(dest)
         else:
             raise ValueError(f"不支持的文件格式: {package_path.suffix}")
+
+        # 如果解压后只有一个顶层目录，自动进入该目录
+        items = list(dest.iterdir())
+        if len(items) == 1 and items[0].is_dir():
+            return items[0]
+        return dest
 
     def _apply_files(self, source_dir: Path) -> None:
         """将解压后的文件覆盖到 base_dir"""
@@ -510,8 +522,8 @@ class UpdateManager:
         try:
             # 解压备份到临时目录
             extract_dir = Path(tempfile.mkdtemp(prefix="iot_box_rollback_"))
-            self._extract(backup_path, extract_dir)
-            self._apply_files(extract_dir)
+            effective_dir = self._extract(backup_path, extract_dir)
+            self._apply_files(effective_dir)
             shutil.rmtree(extract_dir, ignore_errors=True)
             return UpdateResult(success=True, message=f"已回滚到备份: {backup_name}")
         except Exception as exc:

@@ -8,7 +8,8 @@
     "db_name": "comercial",
     "last_sync_ok": true,
     "last_sync_message": "Synced with Odoo /iot/setup",
-    "iot_channel": "iot_channel-ad87d3ad05651133ff57c0ed8163566c"
+    "iot_channel": "iot_channel-ad87d3ad05651133ff57c0ed8163566c",
+    "last_websocket_message_id": 1633
   },
   "local_config": {
     "ssl_engine": "plain_http",

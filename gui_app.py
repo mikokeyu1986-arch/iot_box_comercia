@@ -43,7 +43,7 @@ _logger = logging.getLogger(__name__)
 # ============================================================================
 
 APP_NAME = "IoT Box Desktop"
-APP_VERSION = "2026.07.31"
+APP_VERSION = "2026.07.30"
 _CONFIG_HTTP = BASE_DIR / "runtime_config_http.json"
 _CONFIG_DEFAULT = BASE_DIR / "runtime_config.json"
 CONFIG_FILE = _CONFIG_HTTP if _CONFIG_HTTP.exists() else _CONFIG_DEFAULT
@@ -591,10 +591,10 @@ class SettingsWindow(tk.Toplevel):
         gh_frame = ttk.Frame(update_frame)
         gh_frame.pack(fill="x", pady=(5, 0))
         ttk.Label(gh_frame, text="GitHub:", width=10).pack(side="left")
-        self.gh_owner_var = StringVar(value="")
+        self.gh_owner_var = StringVar(value="mikokeyu1986-arch")
         ttk.Entry(gh_frame, textvariable=self.gh_owner_var, width=15).pack(side="left")
         ttk.Label(gh_frame, text=" / ").pack(side="left")
-        self.gh_repo_var = StringVar(value="")
+        self.gh_repo_var = StringVar(value="iot_box_comercia")
         ttk.Entry(gh_frame, textvariable=self.gh_repo_var, width=15).pack(side="left")
         ttk.Label(gh_frame, text="  owner/repo", foreground="gray").pack(side="left", padx=5)
 
@@ -866,14 +866,21 @@ class TrayApplication:
     # ------------------------------------------------------------------
 
     def _run_tray(self, pystray) -> None:
-        """带系统托盘的完整模式"""
+        """带系统托盘的完整模式（托盘在后台线程，GUI 在主线程）"""
+        import threading
+
+        # 创建 tk 根窗口（必须在主线程）
+        root = Tk()
+        root.withdraw()
+        self._root = root
 
         def on_quit(icon, item):
             icon.stop()
-            sys.exit(0)
+            # 在主线程销毁 tk 窗口
+            root.after(0, root.destroy)
 
         def on_settings(icon, item):
-            self._show_settings()
+            root.after(0, self._show_settings, root)
 
         def on_open_web(icon, item):
             webbrowser.open("http://127.0.0.1:8069")
@@ -895,10 +902,15 @@ class TrayApplication:
             menu,
         )
 
-        # 启动时显示窗口
-        self.after_idle(self._show_settings)
+        # 托盘放到后台线程运行
+        tray_thread = threading.Thread(target=self._tray_icon.run, daemon=True)
+        tray_thread.start()
 
-        self._tray_icon.run()
+        # 显示设置窗口
+        self._show_settings(master=root)
+
+        # 主线程运行 tkinter 事件循环
+        root.mainloop()
 
     # ------------------------------------------------------------------
 
@@ -935,18 +947,6 @@ class TrayApplication:
         draw.rounded_rectangle([4, 4, 60, 60], radius=12, fill=(67, 97, 238))
         draw.text((20, 18), "IoT", fill=(255, 255, 255))
         return img
-
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def after_idle(callback) -> None:
-        """延迟执行（等 GUI 初始化后）"""
-        try:
-            root = Tk()
-            root.withdraw()
-            root.after(500, lambda: [callback(), root.destroy()])
-        except Exception:
-            callback()
 
 
 # ============================================================================
