@@ -13,8 +13,8 @@ IoT Box Desktop - 桌面 GUI 管理工具
 
 from __future__ import annotations
 
-import json
 import logging
+import json
 import os
 import platform
 import subprocess
@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 import webbrowser
+from urllib.request import Request, urlopen
 from pathlib import Path
 import tkinter as tk
 from tkinter import Tk, Frame, Label, Button, Entry, StringVar, IntVar, BooleanVar
@@ -31,6 +32,9 @@ from typing import Any
 
 # 将项目根目录加入 path
 BASE_DIR = Path(__file__).resolve().parent
+REDSYS_DIR = BASE_DIR.parent / "redsys_new"
+REDSYS_SCRIPT = REDSYS_DIR / "server" / "main.py"
+REDSYS_CONFIG = REDSYS_DIR / "config.yaml"
 sys.path.insert(0, str(BASE_DIR))
 
 from app.config_store import ConfigStore
@@ -53,63 +57,25 @@ DEFAULT_TOKEN_URL = "http://192.168.1.1:8069"
 DEFAULT_SCALE_PORT = "COM3"
 DEFAULT_SCALE_BAUDRATE = 9600
 
-# 电子秤品牌预设
+# IoT Box 服务端口（与 run_http.py / run_https.py 一致）
+# HTTP 模式: IOT_HTTP_PORT 默认 8399；HTTPS 模式: IOT_PORT 默认 8398
+HTTP_PORT = 8399
+HTTPS_PORT = 8398
+
+# 电子秤品牌预设 —— 与 app/drivers/scale.py 中 ScaleConfig 支持的品牌一致。
+# runtime 只认 zfoc 和 epelsa 两个 brand，其他品牌不会被 ScaleMonitor 正确解析。
 SCALE_PRESETS: dict[str, dict[str, Any]] = {
-    "Dibal": {
-        "brand": "Dibal",
-        "protocol": "serial_continuous",
+    "Gram Zfoc-p (ZFOC)": {
+        "brand": "zfoc",
         "baudrate": 9600,
-        "bytesize": 8,
-        "parity": "N",
-        "stopbits": 1,
-        "timeout": 1,
-        "encoding": "utf-8",
-        "weight_regex": r"[\d]+[.,][\d]{3}",
+        "timeout": 1.2,
+        "inter_command_delay": 0.05,
     },
-    "CAS": {
-        "brand": "CAS",
-        "protocol": "serial_continuous",
+    "Epelsa 56 PPI": {
+        "brand": "epelsa",
         "baudrate": 9600,
-        "bytesize": 8,
-        "parity": "N",
-        "stopbits": 1,
-        "timeout": 1,
-        "encoding": "ascii",
-        "weight_regex": r"\d+\.\d+",
-    },
-    "Mettler Toledo": {
-        "brand": "Mettler Toledo",
-        "protocol": "serial_command",
-        "command": "SI\r\n",
-        "baudrate": 9600,
-        "bytesize": 7,
-        "parity": "E",
-        "stopbits": 1,
-        "timeout": 2,
-        "encoding": "ascii",
-        "weight_regex": r"\d+\.\d+",
-    },
-    "Generic (连续输出)": {
-        "brand": "Generic",
-        "protocol": "serial_continuous",
-        "baudrate": 9600,
-        "bytesize": 8,
-        "parity": "N",
-        "stopbits": 1,
-        "timeout": 1,
-        "encoding": "ascii",
-        "weight_regex": r"\d+\.\d+",
-    },
-    "Custom": {
-        "brand": "Custom",
-        "protocol": "serial_continuous",
-        "baudrate": 9600,
-        "bytesize": 8,
-        "parity": "N",
-        "stopbits": 1,
-        "timeout": 1,
-        "encoding": "ascii",
-        "weight_regex": r"\d+\.\d+",
+        "timeout": 1.2,
+        "inter_command_delay": 0.05,
     },
 }
 
@@ -148,6 +114,10 @@ class SettingsWindow(tk.Toplevel):
         # 构建 UI
         self._build_notebook()
         self._load_config()
+
+        # 自动启动服务
+        if self.auto_start_var.get():
+            self.after(500, self._on_start)
 
     # ------------------------------------------------------------------
 
@@ -209,11 +179,16 @@ class SettingsWindow(tk.Toplevel):
         proto_frame = ttk.LabelFrame(f, text="协议切换", padding=10)
         proto_frame.pack(fill="x", padx=10, pady=10)
 
-        self.proto_var = StringVar(value="http")
-        rb_http = ttk.Radiobutton(proto_frame, text="HTTP  (端口 8069)", variable=self.proto_var, value="http")
-        rb_https = ttk.Radiobutton(proto_frame, text="HTTPS (端口 8443)", variable=self.proto_var, value="https")
+        self.proto_var = StringVar(value="https")
+        rb_http = ttk.Radiobutton(proto_frame, text=f"HTTP  (端口 {HTTP_PORT})", variable=self.proto_var, value="http")
+        rb_https = ttk.Radiobutton(proto_frame, text=f"HTTPS (端口 {HTTPS_PORT})", variable=self.proto_var, value="https")
         rb_http.pack(side="left", padx=(0, 20))
         rb_https.pack(side="left")
+
+        self.auto_start_var = BooleanVar(value=True)
+        ttk.Checkbutton(proto_frame, text="启动 GUI 后自动启动服务", variable=self.auto_start_var,
+                        command=self._save_service_preferences).pack(side="left", padx=(20, 0))
+        ttk.Button(proto_frame, text="保存协议设置", command=self._save_service_preferences).pack(side="right")
 
         # -- 动作按钮 --
         btn_frame = ttk.Frame(f)
@@ -248,12 +223,47 @@ class SettingsWindow(tk.Toplevel):
         self._append_log(f"正在以 {proto.upper()} 模式启动服务…")
         script = HTTP_SCRIPT if proto == "http" else HTTPS_SCRIPT
         threading.Thread(target=self._run_service, args=(script, proto), daemon=True).start()
+        threading.Thread(target=self._run_redsys_service, daemon=True).start()
+
+    def _run_redsys_service(self) -> None:
+        if not REDSYS_SCRIPT.exists() or not REDSYS_CONFIG.exists():
+            self.after(0, self._append_log, "Redsys 服务未找到，已跳过启动")
+            return
+        if getattr(self, "_redsys_proc", None) and self._redsys_proc.poll() is None:
+            return
+        try:
+            self._redsys_proc = subprocess.Popen(
+                [sys.executable, str(REDSYS_SCRIPT), "--config", str(REDSYS_CONFIG)],
+                cwd=str(REDSYS_DIR),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            self.after(0, self._append_log, "Redsys 服务已启动: http://127.0.0.1:6971")
+            for line in self._redsys_proc.stdout:
+                self.after(0, self._append_log, f"[Redsys] {line.strip()}")
+        except Exception as exc:
+            self.after(0, self._append_log, f"Redsys 启动失败: {exc}")
+
+    def _save_service_preferences(self) -> None:
+        protocol = self.proto_var.get().strip().lower()
+        if protocol not in {"http", "https"}:
+            protocol = "https"
+        self.config_store.update_local_config(
+            service_protocol=protocol,
+            auto_start_service=bool(self.auto_start_var.get()),
+        )
+        self._append_log(f"服务设置已保存: protocol={protocol}, auto_start={self.auto_start_var.get()}")
 
     def _run_service(self, script: Path, proto: str) -> None:
         try:
+            service_env = os.environ.copy()
+            service_env["IOT_CONFIG_PATH"] = str(CONFIG_FILE)
             self._service_proc = subprocess.Popen(
                 [sys.executable, str(script)],
                 cwd=str(BASE_DIR),
+                env=service_env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -274,15 +284,44 @@ class SettingsWindow(tk.Toplevel):
         self._start_time = time.time()
         self._update_uptime()
 
-    def _on_stop(self) -> None:
-        if hasattr(self, "_service_proc") and self._service_proc:
-            self._service_proc.terminate()
-            self._service_proc = None
+    def _stop_service_process(self) -> None:
+        """停止服务子进程并等待退出（线程安全，不操作 GUI widget）。
+
+        terminate() 后等待进程真正退出并释放端口，避免重启时端口仍被占用。
+        """
+        proc = getattr(self, "_service_proc", None)
+        if not proc:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                pass
+        self._service_proc = None
+        redsys_proc = getattr(self, "_redsys_proc", None)
+        if redsys_proc:
+            redsys_proc.terminate()
+            try:
+                redsys_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                redsys_proc.kill()
+            self._redsys_proc = None
+
+    def _update_service_stopped_ui(self) -> None:
+        """更新 GUI 显示服务已停止（仅主线程调用）"""
         self.btn_start.config(state="normal")
         self.btn_stop.config(state="disabled")
         self.btn_restart.config(state="disabled")
         self.lbl_status.config(text="● 服务状态: 已停止", foreground="red")
         self.lbl_uptime.config(text="运行时间: --")
+
+    def _on_stop(self) -> None:
+        self._stop_service_process()
+        self._update_service_stopped_ui()
         self._append_log("服务已停止")
 
     def _on_restart(self) -> None:
@@ -291,7 +330,7 @@ class SettingsWindow(tk.Toplevel):
 
     def _on_open_web(self) -> None:
         proto = self.proto_var.get()
-        port = "8069" if proto == "http" else "8443"
+        port = HTTP_PORT if proto == "http" else HTTPS_PORT
         url = f"{proto}://127.0.0.1:{port}"
         webbrowser.open(url)
 
@@ -312,45 +351,118 @@ class SettingsWindow(tk.Toplevel):
         self.log_text.config(state="disabled")
 
     # ==================================================================
-    # 服务器配置 Tab
+    # 服务器配置 Tab（精简：单一 URL + 绑定状态）
     # ==================================================================
 
     def _build_server_tab(self) -> None:
         f = self.tab_server
 
-        frame = ttk.LabelFrame(f, text="Odoo 服务器连接", padding=15)
-        frame.pack(fill="x", padx=10, pady=10)
+        # -- Token 连接 URL --
+        url_frame = ttk.LabelFrame(f, text="Odoo 连接地址", padding=15)
+        url_frame.pack(fill="x", padx=10, pady=10)
 
-        # Odoo Server URL
-        ttk.Label(frame, text="Odoo 服务器 URL", font=("Segoe UI", 10)).pack(anchor="w")
-        self.odoourl_var = StringVar()
-        ttk.Entry(frame, textvariable=self.odoourl_var, width=60).pack(fill="x", pady=(3, 10))
-        ttk.Label(frame, text="例如: http://192.168.1.100:8069", foreground="gray").pack(anchor="w")
-
-        # Token URL
-        ttk.Label(frame, text="Token 获取 URL", font=("Segoe UI", 10)).pack(anchor="w", pady=(10, 0))
+        ttk.Label(url_frame, text="粘贴 Odoo 生成的 Token 连接地址:", font=("Segoe UI", 10)).pack(anchor="w")
         self.token_url_var = StringVar()
-        ttk.Entry(frame, textvariable=self.token_url_var, width=60).pack(fill="x", pady=(3, 10))
-        ttk.Label(frame, text="与 Odoo URL 通常相同", foreground="gray").pack(anchor="w")
+        url_entry = ttk.Entry(url_frame, textvariable=self.token_url_var, width=60)
+        url_entry.pack(fill="x", pady=(5, 5))
+        ttk.Label(url_frame, text="格式: http://地址:端口?token=xxx&db_uuid=xxx&enterprise_code=&db_name=xxx",
+                  foreground="gray", font=("Segoe UI", 8)).pack(anchor="w")
 
-        # CGI URL
-        ttk.Label(frame, text="CGI 服务器 URL（可选）", font=("Segoe UI", 10)).pack(anchor="w", pady=(10, 0))
-        self.cgi_url_var = StringVar()
-        ttk.Entry(frame, textvariable=self.cgi_url_var, width=60).pack(fill="x", pady=(3, 10))
+        btn_row = ttk.Frame(url_frame)
+        btn_row.pack(fill="x", pady=(10, 0))
+        self.btn_connect = ttk.Button(btn_row, text="🔗  连接并绑定", command=self._on_connect_server)
+        self.btn_connect.pack(side="left", padx=(0, 8))
+        ttk.Button(btn_row, text="断开", command=self._on_disconnect_server).pack(side="left")
 
-        # 保存按钮
-        btn_frame = ttk.Frame(f)
-        btn_frame.pack(fill="x", padx=10, pady=10)
-        ttk.Button(btn_frame, text="💾  保存服务器配置", command=self._on_save_server).pack(side="left")
-        ttk.Label(btn_frame, text="保存后需重启服务生效", foreground="gray").pack(side="left", padx=10)
+        # -- 绑定状态 --
+        status_frame = ttk.LabelFrame(f, text="绑定状态", padding=15)
+        status_frame.pack(fill="x", padx=10, pady=10)
 
-    def _on_save_server(self) -> None:
+        self.lbl_bound_status = ttk.Label(status_frame, text="⏳ 未绑定", font=("Segoe UI", 11, "bold"),
+                                           foreground="gray")
+        self.lbl_bound_status.pack(anchor="w")
+
+        self.lbl_bound_detail = ttk.Frame(status_frame)
+        self.lbl_bound_detail.pack(fill="x", pady=(8, 0))
+        self.lbl_bound_url = ttk.Label(self.lbl_bound_detail, text="", font=("Segoe UI", 9))
+        self.lbl_bound_url.pack(anchor="w")
+        self.lbl_bound_db = ttk.Label(self.lbl_bound_detail, text="", font=("Segoe UI", 9))
+        self.lbl_bound_db.pack(anchor="w")
+        self.lbl_bound_sync = ttk.Label(self.lbl_bound_detail, text="", font=("Segoe UI", 9))
+        self.lbl_bound_sync.pack(anchor="w")
+
+        # 初始加载绑定状态
+        self._refresh_bound_status()
+
+    def _refresh_bound_status(self) -> None:
+        """从配置文件读取并显示当前绑定状态"""
+        conn = self.config_store.get_connection()
+        if conn.get("connected") and conn.get("url"):
+            self.lbl_bound_status.config(text="✅ 已绑定", foreground="green")
+            self.lbl_bound_url.config(text=f"服务器: {conn.get('url', '')}")
+            self.lbl_bound_db.config(text=f"数据库: {conn.get('db_name', '')}")
+            sync_ok = conn.get("last_sync_ok", False)
+            sync_msg = conn.get("last_sync_message", "")
+            if sync_ok:
+                self.lbl_bound_sync.config(text="同步: ✅ 正常", foreground="green")
+            elif sync_msg:
+                self.lbl_bound_sync.config(text=f"同步: ❌ {sync_msg}", foreground="red")
+            else:
+                self.lbl_bound_sync.config(text="同步: 等待同步…", foreground="gray")
+            self.token_url_var.set(
+                f"{conn.get('url', '')}?token={conn.get('token', '')}"
+                f"&db_uuid={conn.get('db_uuid', '')}"
+                f"&enterprise_code={conn.get('enterprise_code', '')}"
+                f"&db_name={conn.get('db_name', '')}"
+            )
+        else:
+            self.lbl_bound_status.config(text="⏳ 未绑定", foreground="gray")
+            self.lbl_bound_url.config(text="")
+            self.lbl_bound_db.config(text="")
+            self.lbl_bound_sync.config(text="")
+
+    def _on_connect_server(self) -> None:
+        """解析 token URL 并绑定"""
+        token_url = self.token_url_var.get().strip()
+        if not token_url:
+            messagebox.showwarning("提示", "请先粘贴 Odoo Token 连接地址")
+            return
+
         try:
-            self._save_config_to_file()
-            self._append_log("服务器配置已保存")
-            messagebox.showinfo("成功", "配置已保存!\n请重启服务使更改生效。")
+            self.btn_connect.config(state="disabled", text="连接中…")
+            self.config_store.connect_from_token_url(token_url)
+            local_url = str(self.config_store.get_local_config().get("local_url") or "http://127.0.0.1:8399").rstrip("/")
+            request = Request(
+                f"{local_url}/api/connect",
+                data=json.dumps({"token_url": token_url}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(request, timeout=15) as response:
+                result = json.loads(response.read().decode("utf-8"))
+            if result.get("server_connection"):
+                self.config_store.update_connection(**result["server_connection"])
+            self._refresh_bound_status()
+            self._append_log(f"已绑定到服务器: {self.config_store.get_connection().get('url', '')}")
+            messagebox.showinfo("成功", "已成功绑定 Odoo 服务器!")
+        except ValueError as e:
+            messagebox.showerror("绑定失败", str(e))
         except Exception as e:
-            messagebox.showerror("错误", f"保存失败: {e}")
+            messagebox.showerror("错误", f"绑定失败: {e}")
+        finally:
+            self.btn_connect.config(state="normal", text="🔗  连接并绑定")
+
+    def _on_disconnect_server(self) -> None:
+        """解除绑定"""
+        if not messagebox.askyesno("确认", "确定要断开与 Odoo 服务器的绑定吗?"):
+            return
+        try:
+            self.config_store.reset_connection()
+            self._refresh_bound_status()
+            self.token_url_var.set("")
+            self._append_log("已解除服务器绑定")
+        except Exception as e:
+            messagebox.showerror("错误", f"断开失败: {e}")
 
     # ==================================================================
     # 电子秤配置 Tab
@@ -379,7 +491,7 @@ class SettingsWindow(tk.Toplevel):
 
         row1 = ttk.Frame(port_frame)
         row1.pack(fill="x", pady=2)
-        ttk.Label(row1, text="串口:", width=12).pack(side="left")
+        ttk.Label(row1, text="串口:", width=14).pack(side="left")
         self.scale_port_var = StringVar(value=DEFAULT_SCALE_PORT)
         self.port_combo = ttk.Combobox(row1, textvariable=self.scale_port_var, width=20)
         self.port_combo.pack(side="left")
@@ -389,68 +501,36 @@ class SettingsWindow(tk.Toplevel):
 
         row2 = ttk.Frame(port_frame)
         row2.pack(fill="x", pady=2)
-        ttk.Label(row2, text="波特率:", width=12).pack(side="left")
+        ttk.Label(row2, text="波特率:", width=14).pack(side="left")
         self.scale_baudrate_var = IntVar(value=DEFAULT_SCALE_BAUDRATE)
-        baud_cb = ttk.Combobox(row2, textvariable=self.scale_baudrate_var,
+        ttk.Combobox(row2, textvariable=self.scale_baudrate_var,
                                 values=[1200, 2400, 4800, 9600, 19200, 38400, 57600, 115200],
-                                width=18)
-        baud_cb.pack(side="left")
+                                width=18).pack(side="left")
 
         row3 = ttk.Frame(port_frame)
         row3.pack(fill="x", pady=2)
-        ttk.Label(row3, text="数据位:", width=12).pack(side="left")
-        self.scale_bytesize_var = IntVar(value=8)
-        ttk.Combobox(row3, textvariable=self.scale_bytesize_var, values=[5, 6, 7, 8], width=18).pack(side="left")
+        ttk.Label(row3, text="超时(秒):", width=14).pack(side="left")
+        self.scale_timeout_var = StringVar(value="1.2")
+        ttk.Entry(row3, textvariable=self.scale_timeout_var, width=20).pack(side="left")
 
         row4 = ttk.Frame(port_frame)
         row4.pack(fill="x", pady=2)
-        ttk.Label(row4, text="校验位:", width=12).pack(side="left")
-        self.scale_parity_var = StringVar(value="N")
-        ttk.Combobox(row4, textvariable=self.scale_parity_var,
-                      values=["N (None)", "E (Even)", "O (Odd)"], width=18).pack(side="left")
+        ttk.Label(row4, text="指令间隔(秒):", width=14).pack(side="left")
+        self.scale_inter_command_delay_var = StringVar(value="0.05")
+        ttk.Entry(row4, textvariable=self.scale_inter_command_delay_var, width=20).pack(side="left")
+        ttk.Label(row4, text="主动探测之间的最小间隔", foreground="gray").pack(side="left", padx=5)
 
-        row5 = ttk.Frame(port_frame)
-        row5.pack(fill="x", pady=2)
-        ttk.Label(row5, text="停止位:", width=12).pack(side="left")
-        self.scale_stopbits_var = IntVar(value=1)
-        ttk.Combobox(row5, textvariable=self.scale_stopbits_var, values=[1, 2], width=18).pack(side="left")
+        # 实时推送选项
+        opt_frame = ttk.LabelFrame(f, text="推送选项", padding=10)
+        opt_frame.pack(fill="x", padx=10, pady=10)
+        # Legacy SSE controls are kept internally but hidden from the GUI.
 
-        row51 = ttk.Frame(port_frame)
-        row51.pack(fill="x", pady=2)
-        ttk.Label(row51, text="超时(秒):", width=12).pack(side="left")
-        self.scale_timeout_var = StringVar(value="1")
-        ttk.Entry(row51, textvariable=self.scale_timeout_var, width=20).pack(side="left")
-
-        # 协议设置
-        proto_frame = ttk.LabelFrame(f, text="数据协议（高级）", padding=10)
-        proto_frame.pack(fill="x", padx=10, pady=10)
-
-        r1 = ttk.Frame(proto_frame)
-        r1.pack(fill="x", pady=2)
-        ttk.Label(r1, text="协议:", width=12).pack(side="left")
-        self.scale_protocol_var = StringVar(value="serial_continuous")
-        ttk.Combobox(r1, textvariable=self.scale_protocol_var,
-                      values=["serial_continuous", "serial_command", "tcp"], width=18).pack(side="left")
-
-        r2 = ttk.Frame(proto_frame)
-        r2.pack(fill="x", pady=2)
-        ttk.Label(r2, text="正则表达式:", width=12).pack(side="left")
-        self.scale_regex_var = StringVar(value=r"\d+\.\d+")
-        ttk.Entry(r2, textvariable=self.scale_regex_var, width=40).pack(side="left")
-
-        r3 = ttk.Frame(proto_frame)
-        r3.pack(fill="x", pady=2)
-        ttk.Label(r3, text="命令(指令模式):", width=12).pack(side="left")
-        self.scale_command_var = StringVar(value="")
-        ttk.Entry(r3, textvariable=self.scale_command_var, width=40).pack(side="left")
-        ttk.Label(r3, text="如: SI\\r\\n", foreground="gray").pack(side="left", padx=5)
-
-        r4 = ttk.Frame(proto_frame)
-        r4.pack(fill="x", pady=2)
-        ttk.Label(r4, text="编码:", width=12).pack(side="left")
-        self.scale_encoding_var = StringVar(value="ascii")
-        ttk.Combobox(r4, textvariable=self.scale_encoding_var,
-                      values=["ascii", "utf-8", "latin-1", "gb2312"], width=18).pack(side="left")
+        self.scale_sse_var = BooleanVar(value=False)
+        ttk.Checkbutton(opt_frame, text="启用 SSE 实时推送（本地 Web UI 显示秤盘跳动；POS 不需要）",
+                        variable=self.scale_sse_var).pack(anchor="w")
+        ttk.Label(opt_frame, text="POS 通过 EventBus 接收重量，无需开启 SSE。仅在本地 Web UI 需要实时显示时开启。",
+                  foreground="gray", font=("Segoe UI", 8)).pack(anchor="w")
+        opt_frame.pack_forget()
 
         # 按钮
         btn_frame = ttk.Frame(f)
@@ -471,64 +551,38 @@ class SettingsWindow(tk.Toplevel):
 
     @staticmethod
     def _list_serial_ports() -> list[str]:
-        """列出系统可用串口"""
+        """列出系统可用串口（pyserial 的 comports() 已足够可靠，无需逐个探测）"""
         try:
             import serial.tools.list_ports
             return [p.device for p in serial.tools.list_ports.comports()]
         except ImportError:
-            pass
-        # 回退：列出常见 COM 口
-        if platform.system() == "Windows":
-            candidates = [f"COM{i}" for i in range(1, 33)]
-            # 简单探测
-            import serial
-            available = []
-            for port in candidates:
-                try:
-                    s = serial.Serial(port)
-                    s.close()
-                    available.append(port)
-                except (OSError, serial.SerialException):
-                    pass
-            return available
-        return []
+            return []
 
     def _apply_preset(self) -> None:
-        brand = self.scale_brand_var.get()
-        preset = SCALE_PRESETS.get(brand)
+        brand_label = self.scale_brand_var.get()
+        preset = SCALE_PRESETS.get(brand_label)
         if not preset:
             return
-        self.scale_port_var.set(DEFAULT_SCALE_PORT)
         self.scale_baudrate_var.set(preset.get("baudrate", 9600))
-        self.scale_bytesize_var.set(preset.get("bytesize", 8))
-        self.scale_parity_var.set(preset.get("parity", "N"))
-        self.scale_stopbits_var.set(preset.get("stopbits", 1))
-        self.scale_timeout_var.set(str(preset.get("timeout", 1)))
-        self.scale_protocol_var.set(preset.get("protocol", "serial_continuous"))
-        self.scale_regex_var.set(preset.get("weight_regex", r"\d+\.\d+"))
-        self.scale_command_var.set(preset.get("command", ""))
-        self.scale_encoding_var.set(preset.get("encoding", "ascii"))
+        self.scale_timeout_var.set(str(preset.get("timeout", 1.2)))
+        self.scale_inter_command_delay_var.set(str(preset.get("inter_command_delay", 0.05)))
         self._refresh_ports()
-        self._append_log(f"已应用 {brand} 预设")
+        self._append_log(f"已应用 {brand_label} 预设 (brand={preset.get('brand')})")
 
     def _on_save_scale(self) -> None:
+        """保存电子秤配置到 config_store（直接写入 local_config，runtime 立即生效）"""
         try:
-            parity_map = {"N (None)": "N", "E (Even)": "E", "O (Odd)": "O"}
-            scale_config = {
-                "protocol": self.scale_protocol_var.get(),
-                "port": self.scale_port_var.get(),
-                "baudrate": self.scale_baudrate_var.get(),
-                "bytesize": self.scale_bytesize_var.get(),
-                "parity": parity_map.get(self.scale_parity_var.get(), self.scale_parity_var.get()),
-                "stopbits": self.scale_stopbits_var.get(),
-                "timeout": float(self.scale_timeout_var.get() or "1"),
-                "encoding": self.scale_encoding_var.get(),
-                "weight_regex": self.scale_regex_var.get(),
-                "brand": self.scale_brand_var.get(),
-                "command": self.scale_command_var.get(),
-            }
-            self._save_config_to_file(scale_override={"scale": scale_config})
-            self._append_log("电子秤配置已保存")
+            brand_label = self.scale_brand_var.get()
+            preset = SCALE_PRESETS.get(brand_label, {})
+            brand_value = preset.get("brand", "zfoc")
+            self.config_store.update_local_config(
+                scale_port=self.scale_port_var.get().strip(),
+                scale_baudrate=int(self.scale_baudrate_var.get()),
+                scale_timeout=float(self.scale_timeout_var.get() or "1.2"),
+                scale_inter_command_delay=float(self.scale_inter_command_delay_var.get() or "0.05"),
+                scale_brand=brand_value,
+            )
+            self._append_log(f"电子秤配置已保存 (port={self.scale_port_var.get()}, brand={brand_value})")
             messagebox.showinfo("成功", "电子秤配置已保存!\n请重启服务使更改生效。")
         except Exception as e:
             messagebox.showerror("错误", f"保存失败: {e}")
@@ -544,15 +598,11 @@ class SettingsWindow(tk.Toplevel):
                 ser = serial.Serial(
                     port=port,
                     baudrate=baudrate,
-                    bytesize=self.scale_bytesize_var.get(),
-                    parity=self.scale_parity_var.get()[:1],
-                    stopbits=self.scale_stopbits_var.get(),
                     timeout=2,
                 )
-                # 尝试读取一行
                 raw = ser.readline()
                 ser.close()
-                text = raw.decode(self.scale_encoding_var.get(), errors="replace").strip()
+                text = raw.decode("latin-1", errors="replace").strip()
                 self.after(0, self._append_log, f"收到: {text}")
                 self.after(0, messagebox.showinfo, "测试结果", f"连接成功!\n读取到数据:\n{text}")
             except Exception as e:
@@ -581,10 +631,10 @@ class SettingsWindow(tk.Toplevel):
         update_frame = ttk.LabelFrame(f, text="在线更新", padding=10)
         update_frame.pack(fill="x", padx=10, pady=10)
 
-        ttk.Label(update_frame, text="更新源:", font=("Segoe UI", 10)).pack(anchor="w")
-        self.update_url_var = StringVar(value=DEFAULT_UPDATE_MANIFEST_URL or "")
+        ttk.Label(update_frame, text="更新源 URL:", font=("Segoe UI", 10)).pack(anchor="w")
+        self.update_url_var = StringVar(value="")
         ttk.Entry(update_frame, textvariable=self.update_url_var, width=60).pack(fill="x", pady=(3, 5))
-        ttk.Label(update_frame, text="填写你的更新清单 URL（JSON），留空使用 GitHub Releases 模式",
+        ttk.Label(update_frame, text="填写自定义更新清单 URL（JSON）；留空则使用下方 GitHub Releases 模式",
                    foreground="gray").pack(anchor="w")
 
         # GitHub 模式
@@ -634,19 +684,23 @@ class SettingsWindow(tk.Toplevel):
     # ------------------------------------------------------------------
 
     def _get_update_manager(self) -> UpdateManager:
-        """根据当前设置构建 UpdateManager"""
+        """根据当前设置构建 UpdateManager（自定义 URL 优先于 GitHub 模式）"""
         custom_url = self.update_url_var.get().strip()
         gh_owner = self.gh_owner_var.get().strip()
         gh_repo = self.gh_repo_var.get().strip()
 
-        if gh_owner and gh_repo:
+        # 自定义 URL 优先
+        if custom_url:
+            source = UpdateSource(manifest_url=custom_url)
+        elif gh_owner and gh_repo:
             source = GitHubUpdateSource(
                 owner=gh_owner,
                 repo=gh_repo,
                 use_prerelease=self.gh_prerelease_var.get(),
             )
         else:
-            source = UpdateSource(manifest_url=custom_url)
+            # 无任何更新源配置，使用默认 URL
+            source = UpdateSource(manifest_url=DEFAULT_UPDATE_MANIFEST_URL)
 
         return UpdateManager(
             current_version=APP_VERSION,
@@ -660,8 +714,12 @@ class SettingsWindow(tk.Toplevel):
         self._latest_version: Any = None
 
         def do_check() -> None:
-            mgr = self._get_update_manager()
-            result = mgr.check_for_updates()
+            try:
+                mgr = self._get_update_manager()
+                result = mgr.check_for_updates()
+            except Exception as exc:
+                from app.updater import UpdateResult
+                result = UpdateResult(False, f"检查更新失败: {exc}", current_version=APP_VERSION)
             self.after(0, self._on_check_done, result)
 
         threading.Thread(target=do_check, daemon=True).start()
@@ -692,6 +750,7 @@ class SettingsWindow(tk.Toplevel):
 
         from app.updater import VersionInfo
         version_info = VersionInfo(self._latest_version)
+        version = version_info.version
         self.btn_download.config(state="disabled", text="下载中…")
         self.progress_var.set(0)
 
@@ -702,30 +761,76 @@ class SettingsWindow(tk.Toplevel):
                     version_info,
                     progress_callback=lambda pct: self.after(0, self.progress_var.set, pct),
                 )
-                self.after(0, self._on_download_done, pkg_path, mgr)
+                self.after(0, self._on_download_done, pkg_path, mgr, version)
             except Exception as e:
                 self.after(0, self._on_download_error, str(e))
 
         threading.Thread(target=do_download, daemon=True).start()
 
-    def _on_download_done(self, pkg_path: Path, mgr: UpdateManager) -> None:
-        self.lbl_update_status.config(text="下载完成，正在安装…", foreground="blue")
-        result = mgr.install_update(pkg_path, mgr.source.parse_latest_release(
-            mgr.source.fetch_manifest()
-        ).version if mgr.source.parse_latest_release(mgr.source.fetch_manifest()) else "unknown")
+    def _on_download_done(self, pkg_path: Path, mgr: UpdateManager, version: str) -> None:
+        """下载完成：在后台线程中停止服务 → 安装 → 通知主线程。"""
+        self.lbl_update_status.config(text="下载完成，正在停止服务并安装…", foreground="blue")
+        self.progress_var.set(0)
 
-        if result.success:
-            self.lbl_update_status.config(
-                text=result.message + "\n请手动重启程序应用更新",
-                foreground="green",
-            )
-            if messagebox.askyesno("更新完成", f"{result.message}\n\n是否现在重启?"):
-                self._on_restart()
-        else:
-            self.lbl_update_status.config(text=result.message, foreground="red")
+        def do_install() -> None:
+            # 安装前停止服务进程（在子线程中操作，避免阻塞 GUI），
+            # 否则 Windows 上可能因文件锁导致覆盖失败或运行中的服务加载半更新的模块。
+            self._stop_service_process()
+            self.after(0, self._update_service_stopped_ui)
+            self.after(0, lambda: self._append_log("服务已停止，正在安装更新…"))
+            # 等待端口释放
+            time.sleep(0.5)
+            try:
+                result = mgr.install_update(pkg_path, version)
+            except Exception as exc:
+                from app.updater import UpdateResult
+                result = UpdateResult(False, f"安装失败: {exc}")
+            self.after(0, self._on_install_done, result)
 
+        threading.Thread(target=do_install, daemon=True).start()
+
+    def _on_install_done(self, result: Any) -> None:
+        """安装完成（主线程）：提示用户并选择是否重启整个 GUI。"""
         self.btn_download.config(state="disabled", text="⬇  下载并安装")
         self.progress_var.set(0)
+        if result.success:
+            self.lbl_update_status.config(text=result.message, foreground="green")
+            if messagebox.askyesno("更新完成", f"{result.message}\n\n需要重启程序使更新生效，是否现在重启？"):
+                self._restart_gui()
+            else:
+                # 用户选择稍后重启：重新启动服务，让现有版本继续可用
+                self.after(500, self._on_start)
+        else:
+            self.lbl_update_status.config(text=result.message, foreground="red")
+            # 安装失败：重新启动旧版本服务
+            self.after(500, self._on_start)
+
+    @staticmethod
+    def _resolve_pythonw(exe: str) -> str:
+        """尝试把 python.exe 换成 pythonw.exe（不弹 CMD 黑框），找不到则回退原 exe。"""
+        if not exe or not exe.lower().endswith("python.exe"):
+            return exe
+        candidate = exe[:-len("python.exe")] + "pythonw.exe"
+        return candidate if os.path.isfile(candidate) else exe
+
+    def _restart_gui(self) -> None:
+        """重启整个 GUI 程序（不仅是服务），让更新的代码生效。"""
+        self._stop_service_process()
+        time.sleep(1.0)
+        # 优先用 pythonw.exe 启动新 GUI，避免再弹一个 CMD 窗口
+        gui_py = self._resolve_pythonw(sys.executable)
+        subprocess.Popen(
+            [gui_py, str(BASE_DIR / "gui_app.py")],
+            cwd=str(BASE_DIR),
+            creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0,
+        )
+        # 退出当前 GUI（销毁根窗口，终止事件循环）
+        try:
+            master = self.master
+            if master is not None:
+                master.destroy()
+        except Exception:
+            os._exit(0)
 
     def _on_download_error(self, error: str) -> None:
         self.lbl_update_status.config(text=f"下载失败: {error}", foreground="red")
@@ -761,82 +866,26 @@ class SettingsWindow(tk.Toplevel):
     # ==================================================================
 
     def _load_config(self) -> None:
-        """从 runtime_config_http.json 加载配置"""
-        try:
-            if CONFIG_FILE.exists():
-                cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            else:
-                cfg = {}
-        except Exception:
-            cfg = {}
+        """从 config_store 加载电子秤设置（与 runtime 读取同一份 local_config）"""
+        local = self.config_store.get_local_config()
+        self.scale_port_var.set(local.get("scale_port", DEFAULT_SCALE_PORT))
+        self.scale_baudrate_var.set(local.get("scale_baudrate", DEFAULT_SCALE_BAUDRATE))
+        self.scale_timeout_var.set(str(local.get("scale_timeout", 1.2)))
+        self.scale_inter_command_delay_var.set(str(local.get("scale_inter_command_delay", 0.05)))
+        saved_protocol = str(local.get("service_protocol") or "https").strip().lower()
+        self.proto_var.set(saved_protocol if saved_protocol in {"http", "https"} else "https")
+        self.auto_start_var.set(bool(local.get("auto_start_service", True)))
 
-        odoo = cfg.get("odoo", {})
-        self.odoourl_var.set(odoo.get("url", DEFAULT_ODOO_URL))
-        self.token_url_var.set(cfg.get("token_server_url", "") or DEFAULT_TOKEN_URL)
-        self.cgi_url_var.set(cfg.get("cgi_server_url", ""))
-
-        scale = cfg.get("scale", {})
-        self.scale_port_var.set(scale.get("port", DEFAULT_SCALE_PORT))
-        self.scale_baudrate_var.set(scale.get("baudrate", DEFAULT_SCALE_BAUDRATE))
-        self.scale_bytesize_var.set(scale.get("bytesize", 8))
-        self.scale_parity_var.set(scale.get("parity", "N"))
-        self.scale_stopbits_var.set(scale.get("stopbits", 1))
-        self.scale_timeout_var.set(str(scale.get("timeout", 1)))
-        self.scale_protocol_var.set(scale.get("protocol", "serial_continuous"))
-        self.scale_regex_var.set(scale.get("weight_regex", r"\d+\.\d+"))
-        self.scale_command_var.set(scale.get("command", ""))
-        self.scale_encoding_var.set(scale.get("encoding", "ascii"))
-        self.scale_brand_var.set(scale.get("brand", "Generic (连续输出)"))
+        # 根据已保存的 brand 选中对应预设
+        saved_brand = str(local.get("scale_brand") or "zfoc").strip().lower()
+        matched_label = None
+        for label, preset in SCALE_PRESETS.items():
+            if preset.get("brand") == saved_brand:
+                matched_label = label
+                break
+        self.scale_brand_var.set(matched_label or list(SCALE_PRESETS.keys())[0])
 
         self._refresh_ports()
-
-    def _save_config_to_file(self, scale_override: dict[str, Any] | None = None) -> None:
-        """将当前设置写回 runtime_config_http.json"""
-        try:
-            if CONFIG_FILE.exists():
-                cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
-            else:
-                cfg = {}
-
-            # 服务器配置
-            odoo = cfg.get("odoo", {})
-            if isinstance(odoo, dict):
-                odoo["url"] = self.odoourl_var.get()
-            else:
-                odoo = {"url": self.odoourl_var.get()}
-            cfg["odoo"] = odoo
-
-            if self.token_url_var.get():
-                cfg["token_server_url"] = self.token_url_var.get()
-            if self.cgi_url_var.get():
-                cfg["cgi_server_url"] = self.cgi_url_var.get()
-
-            # 电子秤配置
-            if scale_override:
-                cfg["scale"] = scale_override.get("scale", scale_override)
-            else:
-                parity_map = {"N (None)": "N", "E (Even)": "E", "O (Odd)": "O"}
-                cfg["scale"] = {
-                    "protocol": self.scale_protocol_var.get(),
-                    "port": self.scale_port_var.get(),
-                    "baudrate": self.scale_baudrate_var.get(),
-                    "bytesize": self.scale_bytesize_var.get(),
-                    "parity": parity_map.get(self.scale_parity_var.get(), self.scale_parity_var.get()),
-                    "stopbits": self.scale_stopbits_var.get(),
-                    "timeout": float(self.scale_timeout_var.get() or "1"),
-                    "encoding": self.scale_encoding_var.get(),
-                    "weight_regex": self.scale_regex_var.get(),
-                    "brand": self.scale_brand_var.get(),
-                    "command": self.scale_command_var.get(),
-                }
-
-            CONFIG_FILE.write_text(
-                json.dumps(cfg, indent=2, ensure_ascii=False),
-                encoding="utf-8",
-            )
-        except Exception as e:
-            _logger.exception("保存配置失败")
-            raise
 
 
 # ============================================================================
@@ -883,7 +932,7 @@ class TrayApplication:
             root.after(0, self._show_settings, root)
 
         def on_open_web(icon, item):
-            webbrowser.open("http://127.0.0.1:8069")
+            webbrowser.open(f"http://127.0.0.1:{HTTP_PORT}")
 
         # 图标
         icon_image = self._load_icon(pystray)

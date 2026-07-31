@@ -906,27 +906,43 @@ async def api_connect(payload: dict[str, Any]) -> dict[str, Any]:
         connection = config_store.connect_from_token_url(token_url)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    sync = odoo_sync.sync_setup(
-        server_url=connection.get("url", ""),
-        token=connection.get("token", ""),
-        identifier=IOT_IDENTIFIER,
-        ip=IOT_IP,
-        version=IOT_VERSION,
-        devices=device_manager.as_odoo_devices_payload(),
-    )
+    # A token is single-use on the Odoo side.  When the Odoo port/server is
+    # changed, never keep a channel from the previous registration.
+    config_store.update_connection(iot_channel="", last_websocket_message_id=0)
+    sync = None
+    for attempt in range(3):
+        sync = await asyncio.to_thread(
+            odoo_sync.sync_setup,
+            server_url=connection.get("url", ""),
+            token=connection.get("token", ""),
+            identifier=IOT_IDENTIFIER,
+            ip=IOT_IP,
+            version=IOT_VERSION,
+            devices=device_manager.as_odoo_devices_payload(),
+        )
+        if not sync.ok or sync.iot_channel:
+            break
+        await asyncio.sleep(0.5 * (attempt + 1))
+    assert sync is not None
     config_store.set_sync_status(sync.ok, sync.message)
     if sync.ok and sync.iot_channel:
         config_store.update_connection(iot_channel=sync.iot_channel)
-    if not sync.ok:
-        config_store.reset_connection(message=sync.message)
+    if not sync.ok or not sync.iot_channel:
+        message = sync.message
+        if sync.ok and not sync.iot_channel:
+            message = (
+                "Odoo /iot/setup returned no iot_channel. "
+                "Please generate a new pairing token and verify the Odoo port."
+            )
+        config_store.reset_connection(message=message)
         dev_log(
             "api_connect_failed",
             server_url=connection.get("url", ""),
             db_name=connection.get("db_name", ""),
             db_uuid=connection.get("db_uuid", ""),
-            sync_message=sync.message,
+            sync_message=message,
         )
-        raise HTTPException(status_code=502, detail=sync.message)
+        raise HTTPException(status_code=502, detail=message)
     dev_log(
         "api_connect_success",
         server_url=connection.get("url", ""),
@@ -938,7 +954,7 @@ async def api_connect(payload: dict[str, Any]) -> dict[str, Any]:
     )
     if IOT_ENABLE_CLOUD_BRIDGE:
         await cloud_bridge.request_reconnect(message="Odoo connection updated from /api/connect")
-    return {"status": "success", "server_connection": connection}
+    return {"status": "success", "server_connection": config_store.get_connection()}
 
 
 @app.post("/api/disconnect")
