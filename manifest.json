@@ -1,0 +1,8 @@
+{
+  "version": "2026.08.01",
+  "release_date": "2026-08-01",
+  "changelog": "测试更新功能\n- 修复 GUI 白屏问题\n- GitHub 配置预填\n- 解压兼容性修复",
+  "download_url": "https://github.com/mikokeyu1986-arch/iot_box_comercia/archive/refs/tags/v2026.08.01.zip",
+  "checksum": "",
+  "file_size": 0
+}

@@ -31,7 +31,7 @@ _logger = logging.getLogger(__name__)
 
 DEFAULT_UPDATE_MANIFEST_URL = os.getenv(
     "IOT_UPDATE_MANIFEST_URL",
-    "",  # 部署时替换为你的更新服务器地址
+    "https://raw.githubusercontent.com/mikokeyu1986-arch/iot_box_comercia/master/manifest.json",
 )
 
 # ---------------------------------------------------------------------------
