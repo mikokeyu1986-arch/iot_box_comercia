@@ -972,7 +972,7 @@ class SettingsWindow(tk.Toplevel):
         update_frame.pack(fill="x", padx=10, pady=10)
 
         ttk.Label(update_frame, text="更新源 URL:", font=("Segoe UI", 10)).pack(anchor="w")
-        self.update_url_var = StringVar(value="")
+        self.update_url_var = StringVar(value=DEFAULT_UPDATE_MANIFEST_URL)
         ttk.Entry(update_frame, textvariable=self.update_url_var, width=60).pack(fill="x", pady=(3, 5))
         ttk.Label(update_frame, text="填写自定义更新清单 URL（JSON）；留空则使用下方 GitHub Releases 模式",
                    foreground="gray").pack(anchor="w")
