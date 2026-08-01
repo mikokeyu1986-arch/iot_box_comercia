@@ -35,3 +35,18 @@ The main `runtime_config.json` is reserved for HTTPS on `https://127.0.0.1:8398`
 Detailed developer diagnostics are written to `logs/dev_debug.log`.
 
 If you want this copy to use a different config path, set `IOT_CONFIG_PATH` before starting.
+
+## Visual receipt editor
+
+After pairing the runtime, open its local control page and use **Receipt Studio / 小票可视化编辑器**. It supports:
+
+- drag-and-drop block ordering;
+- per-block visibility, alignment, bold style, and spacing;
+- editable company, invoice, order-information, and footer text;
+- custom text, separator, and spacer blocks;
+- a fixed 80 mm / 48-character live preview matching the configured printer;
+- undo, reset, and persistent save.
+
+The validated template is stored in `receipt_template.json` beside the runtime files. Set
+`IOT_RECEIPT_TEMPLATE_PATH` to use a different location. The editor only accepts known receipt
+blocks and safe style values; it does not execute template code.

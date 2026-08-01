@@ -1,0 +1,183 @@
+{
+  "lines": [
+    {
+      "text": "示例餐厅",
+      "align": "center",
+      "bold": true
+    },
+    {
+      "text": "Calle Ejemplo 1",
+      "align": "center",
+      "bold": false
+    },
+    {
+      "text": "35001 Las Palmas",
+      "align": "center"
+    },
+    {
+      "text": "España",
+      "align": "center"
+    },
+    {
+      "text": "+34 600 000 000",
+      "align": "center"
+    },
+    {
+      "text": "",
+      "align": "left",
+      "classes": [
+        "receipt-spacer"
+      ]
+    },
+    {
+      "text": "桌号 A08",
+      "align": "center",
+      "bold": true,
+      "double_width": true,
+      "double_height": true
+    },
+    {
+      "text": "",
+      "align": "left",
+      "classes": [
+        "receipt-spacer"
+      ]
+    },
+    {
+      "text": "**************************",
+      "align": "center",
+      "classes": [
+        "invoice-asterisk-border"
+      ]
+    },
+    {
+      "text": "Factura Simplificada",
+      "align": "center",
+      "bold": true
+    },
+    {
+      "text": "Fs/2026/00042",
+      "align": "center"
+    },
+    {
+      "text": "**************************",
+      "align": "center",
+      "classes": [
+        "invoice-asterisk-border"
+      ]
+    },
+    {
+      "text": "",
+      "align": "left",
+      "classes": [
+        "receipt-spacer"
+      ]
+    },
+    {
+      "text": "订单 订单 00042",
+      "align": "center",
+      "bold": true
+    },
+    {
+      "text": "2026-08-01 20:30 | 收银员",
+      "align": "center"
+    },
+    {
+      "text": "",
+      "align": "left",
+      "classes": [
+        "receipt-spacer"
+      ]
+    },
+    {
+      "text": "",
+      "align": "left",
+      "classes": [
+        "receipt-spacer"
+      ]
+    },
+    {
+      "type": "product_line",
+      "qty": "2",
+      "name": "牛肉汉堡",
+      "total": "17.00 €",
+      "combo_items": [
+        "加芝士"
+      ]
+    },
+    {
+      "type": "spacer",
+      "align": "left",
+      "classes": [
+        "receipt-spacer",
+        "product-line-spacer"
+      ]
+    },
+    {
+      "type": "product_line",
+      "qty": "1",
+      "name": "可乐",
+      "total": "3.00 €",
+      "combo_items": []
+    },
+    {
+      "type": "spacer",
+      "align": "left",
+      "classes": [
+        "receipt-spacer",
+        "product-line-spacer"
+      ]
+    },
+    {
+      "text": "",
+      "align": "left",
+      "classes": [
+        "receipt-spacer"
+      ]
+    },
+    {
+      "type": "header_meta_line",
+      "left_text": "小计",
+      "right_text": "20.00 €"
+    },
+    {
+      "type": "header_meta_line",
+      "left_text": "IGIC 7%",
+      "right_text": "1.31 €"
+    },
+    {
+      "text": "------------------------------------------------",
+      "align": "left"
+    },
+    {
+      "text": "合计 20.00 €",
+      "align": "center",
+      "bold": true,
+      "double_width": true,
+      "double_height": true
+    },
+    {
+      "text": "------------------------------------------------",
+      "align": "left"
+    },
+    {
+      "type": "header_meta_line",
+      "left_text": "现金",
+      "right_text": "20.00 €"
+    },
+    {
+      "text": "谢谢惠顾",
+      "align": "center",
+      "classes": [
+        "pos-config-name"
+      ]
+    },
+    {
+      "text": "欢迎再次光临",
+      "align": "center",
+      "classes": [
+        "pos-config-name"
+      ]
+    }
+  ]
+}

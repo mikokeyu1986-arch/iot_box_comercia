@@ -597,3 +597,443 @@ if (query.get("token") && query.get("db_uuid")) {
       setFeedback("formFeedback", error.message || "Auto connect failed.", "error");
     });
 }
+
+// ── Visual ESC/POS receipt editor ───────────────────────────────────
+
+let receiptTemplate = null;
+let selectedReceiptBlockId = null;
+let draggedReceiptBlockId = null;
+let receiptHistory = [];
+let receiptPreviewTimer = null;
+
+function cloneReceiptTemplate(value) {
+  return JSON.parse(JSON.stringify(value));
+}
+
+function setReceiptDirty(dirty) {
+  const chip = el("receiptSaveState");
+  chip.textContent = dirty ? "有未保存修改" : "已保存";
+  chip.className = `state-chip ${dirty ? "state-chip-warn" : "state-chip-ok"}`;
+}
+
+function rememberReceiptTemplate() {
+  if (!receiptTemplate) return;
+  receiptHistory.push(cloneReceiptTemplate(receiptTemplate));
+  if (receiptHistory.length > 30) receiptHistory.shift();
+  el("receiptUndo").disabled = receiptHistory.length === 0;
+}
+
+function receiptBlockById(blockId) {
+  return receiptTemplate?.blocks?.find((block) => block.id === blockId) || null;
+}
+
+function receiptProductHeaderBlock() {
+  return receiptBlockById("product_header");
+}
+
+function renderReceiptBlockList() {
+  const list = el("receiptBlockList");
+  clearNode(list);
+  for (const block of receiptTemplate?.blocks || []) {
+    const item = document.createElement("article");
+    item.className = "receipt-block-item";
+    if (!block.enabled) item.classList.add("is-disabled");
+    if (block.id === selectedReceiptBlockId) item.classList.add("is-selected");
+    item.dataset.blockId = block.id;
+    item.draggable = true;
+
+    const handle = document.createElement("span");
+    handle.className = "receipt-drag-handle";
+    handle.textContent = "⋮⋮";
+    handle.title = "拖动排序";
+
+    const name = document.createElement("span");
+    name.className = "receipt-block-name";
+    name.textContent = block.label;
+
+    const visibility = document.createElement("button");
+    visibility.type = "button";
+    visibility.className = "receipt-visibility";
+    visibility.textContent = block.enabled ? "显示" : "隐藏";
+    visibility.title = block.enabled ? "点击隐藏" : "点击显示";
+    visibility.addEventListener("click", (event) => {
+      event.stopPropagation();
+      rememberReceiptTemplate();
+      block.enabled = !block.enabled;
+      receiptTemplateChanged();
+    });
+
+    item.append(handle, name, visibility);
+    item.addEventListener("click", () => selectReceiptBlock(block.id));
+    item.addEventListener("dragstart", (event) => {
+      draggedReceiptBlockId = block.id;
+      item.classList.add("is-dragging");
+      event.dataTransfer.effectAllowed = "move";
+      event.dataTransfer.setData("text/plain", block.id);
+    });
+    item.addEventListener("dragend", () => {
+      draggedReceiptBlockId = null;
+      item.classList.remove("is-dragging");
+    });
+    item.addEventListener("dragover", (event) => {
+      event.preventDefault();
+      event.dataTransfer.dropEffect = "move";
+    });
+    item.addEventListener("drop", (event) => {
+      event.preventDefault();
+      const sourceId = draggedReceiptBlockId || event.dataTransfer.getData("text/plain");
+      if (!sourceId || sourceId === block.id) return;
+      const sourceIndex = receiptTemplate.blocks.findIndex((entry) => entry.id === sourceId);
+      const targetIndex = receiptTemplate.blocks.findIndex((entry) => entry.id === block.id);
+      if (sourceIndex < 0 || targetIndex < 0) return;
+      rememberReceiptTemplate();
+      const [moved] = receiptTemplate.blocks.splice(sourceIndex, 1);
+      receiptTemplate.blocks.splice(targetIndex, 0, moved);
+      receiptTemplateChanged();
+    });
+    list.appendChild(item);
+  }
+}
+
+function selectReceiptBlock(blockId) {
+  selectedReceiptBlockId = blockId;
+  const block = receiptBlockById(blockId);
+  el("receiptInspectorEmpty").classList.toggle("hidden", Boolean(block));
+  el("receiptInspectorForm").classList.toggle("hidden", !block);
+  if (block) {
+    const kind = block.kind || "builtin";
+    const canOverrideContent = kind === "builtin" && ["company", "invoice", "order_info", "product_header", "footer"].includes(block.id);
+    el("receiptInspectorHint").textContent = block.label;
+    el("receiptBlockEnabled").checked = Boolean(block.enabled);
+    el("receiptBlockAlign").value = block.align || "inherit";
+    el("receiptBlockBold").value = String(block.bold ?? "inherit");
+    el("receiptHorizontalOffsetRange").value = Number(block.horizontal_offset || 0);
+    el("receiptHorizontalOffset").value = Number(block.horizontal_offset || 0);
+    el("receiptBlockSpacing").value = Number(block.spacing_after || 0);
+    el("receiptBlockContentField").classList.toggle("hidden", !canOverrideContent);
+    const usesProductColumns = ["product_header", "products"].includes(block.id);
+    const headerBlock = receiptProductHeaderBlock() || block;
+    el("receiptHorizontalOffsetField").classList.toggle("hidden", usesProductColumns);
+    el("receiptProductHeaderFields").classList.toggle("hidden", !usesProductColumns);
+    el("receiptCustomTextField").classList.toggle("hidden", kind !== "text");
+    el("receiptSeparatorField").classList.toggle("hidden", kind !== "separator");
+    el("receiptSpacerField").classList.toggle("hidden", kind !== "spacer");
+    el("receiptDoubleSizeField").classList.toggle("hidden", kind !== "text");
+    el("receiptDeleteBlock").classList.toggle("hidden", kind === "builtin");
+    el("receiptBlockContent").value = block.content || "";
+    el("receiptQtyLabel").value = headerBlock.qty_label || "Uds.";
+    el("receiptProductLabel").value = headerBlock.product_label || "Producto";
+    el("receiptAmountLabel").value = headerBlock.amount_label || "Importe";
+    el("receiptQtyColumns").value = Number(headerBlock.qty_columns || 6);
+    el("receiptAmountColumns").value = Number(headerBlock.amount_columns || 10);
+    el("receiptProductColumns").value = Number(headerBlock.product_columns || 28);
+    el("receiptColumnGutter").value = Math.max(
+      0,
+      48 - Number(headerBlock.qty_columns || 6)
+        - Number(headerBlock.product_columns || 28)
+        - Number(headerBlock.amount_columns || 10)
+    );
+    el("receiptCustomText").value = block.text || "";
+    el("receiptSeparatorCharacter").value = block.character || "-";
+    el("receiptSpacerLines").value = Number(block.lines || 1);
+    el("receiptDoubleSize").checked = Boolean(block.double_size);
+  }
+  renderReceiptBlockList();
+}
+
+function receiptTemplateChanged() {
+  setReceiptDirty(true);
+  el("receiptUndo").disabled = receiptHistory.length === 0;
+  renderReceiptBlockList();
+  if (selectedReceiptBlockId) selectReceiptBlock(selectedReceiptBlockId);
+  scheduleReceiptPreview();
+}
+
+function updateSelectedReceiptBlock(field, value) {
+  const block = receiptBlockById(selectedReceiptBlockId);
+  if (!block || block[field] === value) return;
+  rememberReceiptTemplate();
+  block[field] = value;
+  receiptTemplateChanged();
+}
+
+function addReceiptBlock(kind) {
+  const suffix = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  const defaults = {
+    text: {label: "自定义文字", text: "在这里输入文字", align: "center", double_size: false},
+    separator: {label: "自定义分隔线", character: "-", align: "left"},
+    spacer: {label: "自定义空行", lines: 1, align: "left"},
+  };
+  rememberReceiptTemplate();
+  const block = {
+    id: `custom_${suffix}`,
+    kind,
+    enabled: true,
+    bold: "inherit",
+    horizontal_offset: 0,
+    spacing_after: 0,
+    ...defaults[kind],
+  };
+  const selectedIndex = receiptTemplate.blocks.findIndex((item) => item.id === selectedReceiptBlockId);
+  receiptTemplate.blocks.splice(selectedIndex >= 0 ? selectedIndex + 1 : receiptTemplate.blocks.length, 0, block);
+  selectedReceiptBlockId = block.id;
+  receiptTemplateChanged();
+  el(kind === "text" ? "receiptCustomText" : kind === "separator" ? "receiptSeparatorCharacter" : "receiptSpacerLines").focus();
+}
+
+function captureTextEditHistory(event) {
+  if (event.target.dataset.historyCaptured === "yes") return;
+  rememberReceiptTemplate();
+  event.target.dataset.historyCaptured = "yes";
+}
+
+function finishTextEditHistory(event) {
+  delete event.target.dataset.historyCaptured;
+}
+
+function scheduleReceiptPreview() {
+  window.clearTimeout(receiptPreviewTimer);
+  receiptPreviewTimer = window.setTimeout(previewReceiptTemplate, 120);
+}
+
+function receiptLineText(line, width) {
+  if (line.type === "image") return `[ 图片 · ${line.image_kind || "image"} ]`;
+  if (line.type === "header_meta_line") {
+    const left = String(line.left_text || "");
+    const right = String(line.right_text || "");
+    return `${left}${" ".repeat(Math.max(1, width - left.length - right.length))}${right}`;
+  }
+  if (line.type === "product_line") {
+    const left = `${line.qty || ""} x ${line.name || ""}`.trim();
+    const right = String(line.total || "");
+    return `${left}${" ".repeat(Math.max(1, width - left.length - right.length))}${right}`;
+  }
+  return String(line.text || "");
+}
+
+function renderReceiptPreview(lines, width) {
+  const paper = el("receiptPaper");
+  clearNode(paper);
+  paper.style.setProperty("--paper-chars", width);
+  el("receiptPreviewWidth").textContent = `${width} 字符`;
+  for (const line of lines || []) {
+    const row = document.createElement("div");
+    row.className = "receipt-preview-line";
+    if (line.align === "center") row.classList.add("align-center");
+    if (line.align === "right") row.classList.add("align-right");
+    if (line.bold) row.classList.add("is-bold");
+    if (line.double_width || line.double_height) row.classList.add("is-double");
+    if (line.type === "image") row.classList.add("is-image");
+    row.textContent = receiptLineText(line, width) || " ";
+    paper.appendChild(row);
+    for (const option of line.combo_items || []) {
+      const optionRow = document.createElement("div");
+      optionRow.className = "receipt-preview-line";
+      optionRow.textContent = `  + ${option}`;
+      paper.appendChild(optionRow);
+    }
+  }
+}
+
+async function previewReceiptTemplate() {
+  if (!receiptTemplate) return;
+  const requested = cloneReceiptTemplate(receiptTemplate);
+  requested.name = el("receiptTemplateName").value.trim() || "自定义小票";
+  requested.paper_width = Number(el("receiptPaperWidth").value) || 48;
+  try {
+    const result = await getJSON("/api/receipt-template/preview", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(requested),
+    });
+    renderReceiptPreview(result.lines, requested.paper_width);
+    setFeedback("receiptFeedback", "预览已更新。", "success");
+  } catch (error) {
+    setFeedback("receiptFeedback", error.message || "预览失败", "error");
+  }
+}
+
+async function loadReceiptEditor() {
+  try {
+    const result = await getJSON("/api/receipt-template");
+    receiptTemplate = result.template;
+    receiptHistory = [];
+    el("receiptTemplateName").value = receiptTemplate.name;
+    el("receiptPaperWidth").value = String(receiptTemplate.paper_width);
+    selectedReceiptBlockId = receiptTemplate.blocks?.[0]?.id || null;
+    selectReceiptBlock(selectedReceiptBlockId);
+    setReceiptDirty(false);
+    el("receiptUndo").disabled = true;
+    await previewReceiptTemplate();
+  } catch (error) {
+    setFeedback("receiptFeedback", error.message || "无法加载小票模板", "error");
+  }
+}
+
+el("receiptBlockEnabled").addEventListener("change", (event) => {
+  updateSelectedReceiptBlock("enabled", event.target.checked);
+});
+el("receiptBlockAlign").addEventListener("change", (event) => {
+  updateSelectedReceiptBlock("align", event.target.value);
+});
+el("receiptBlockBold").addEventListener("change", (event) => {
+  const value = event.target.value === "inherit" ? "inherit" : event.target.value === "true";
+  updateSelectedReceiptBlock("bold", value);
+});
+function updateReceiptHorizontalOffset(value) {
+  const offset = Math.max(-12, Math.min(12, Number(value) || 0));
+  el("receiptHorizontalOffsetRange").value = offset;
+  el("receiptHorizontalOffset").value = offset;
+  updateSelectedReceiptBlock("horizontal_offset", offset);
+}
+el("receiptHorizontalOffsetRange").addEventListener("change", (event) => {
+  updateReceiptHorizontalOffset(event.target.value);
+});
+el("receiptHorizontalOffset").addEventListener("change", (event) => {
+  updateReceiptHorizontalOffset(event.target.value);
+});
+el("receiptBlockSpacing").addEventListener("change", (event) => {
+  updateSelectedReceiptBlock("spacing_after", Math.max(0, Math.min(4, Number(event.target.value) || 0)));
+});
+el("receiptBlockContent").addEventListener("input", (event) => {
+  const block = receiptBlockById(selectedReceiptBlockId);
+  if (!block) return;
+  captureTextEditHistory(event);
+  block.content = event.target.value;
+  setReceiptDirty(true);
+  scheduleReceiptPreview();
+});
+el("receiptBlockContent").addEventListener("blur", finishTextEditHistory);
+function updateProductHeaderColumns(changedField, rawValue) {
+  const block = receiptProductHeaderBlock();
+  if (!block || !["product_header", "products"].includes(selectedReceiptBlockId)) return;
+  rememberReceiptTemplate();
+  let qty = Math.max(5, Math.min(12, Number(block.qty_columns || 6)));
+  let product = Math.max(12, Math.min(32, Number(block.product_columns || 28)));
+  let amount = Math.max(8, Math.min(16, Number(block.amount_columns || 10)));
+  if (changedField === "qty_columns") qty = Math.max(5, Math.min(12, Number(rawValue) || 6));
+  if (changedField === "product_columns") product = Math.max(12, Math.min(32, Number(rawValue) || 28));
+  if (changedField === "amount_columns") amount = Math.max(8, Math.min(16, Number(rawValue) || 10));
+  product = Math.min(product, 48 - qty - amount);
+  block.qty_columns = qty;
+  block.product_columns = product;
+  block.amount_columns = amount;
+  block.gutter_columns = 48 - qty - product - amount;
+  receiptTemplateChanged();
+}
+el("receiptQtyColumns").addEventListener("change", (event) => {
+  updateProductHeaderColumns("qty_columns", event.target.value);
+});
+el("receiptAmountColumns").addEventListener("change", (event) => {
+  updateProductHeaderColumns("amount_columns", event.target.value);
+});
+el("receiptProductColumns").addEventListener("change", (event) => {
+  updateProductHeaderColumns("product_columns", event.target.value);
+});
+for (const [elementId, field] of [
+  ["receiptQtyLabel", "qty_label"],
+  ["receiptProductLabel", "product_label"],
+  ["receiptAmountLabel", "amount_label"],
+]) {
+  el(elementId).addEventListener("input", (event) => {
+    const block = receiptProductHeaderBlock();
+    if (!block || !["product_header", "products"].includes(selectedReceiptBlockId)) return;
+    captureTextEditHistory(event);
+    block[field] = event.target.value;
+    setReceiptDirty(true);
+    scheduleReceiptPreview();
+  });
+  el(elementId).addEventListener("blur", finishTextEditHistory);
+}
+el("receiptCustomText").addEventListener("input", (event) => {
+  const block = receiptBlockById(selectedReceiptBlockId);
+  if (!block) return;
+  captureTextEditHistory(event);
+  block.text = event.target.value;
+  block.label = event.target.value.split("\n").find((line) => line.trim())?.trim().slice(0, 24) || "自定义文字";
+  setReceiptDirty(true);
+  renderReceiptBlockList();
+  scheduleReceiptPreview();
+});
+el("receiptCustomText").addEventListener("blur", finishTextEditHistory);
+el("receiptSeparatorCharacter").addEventListener("change", (event) => {
+  updateSelectedReceiptBlock("character", event.target.value);
+});
+el("receiptSpacerLines").addEventListener("change", (event) => {
+  updateSelectedReceiptBlock("lines", Math.max(1, Math.min(6, Number(event.target.value) || 1)));
+});
+el("receiptDoubleSize").addEventListener("change", (event) => {
+  updateSelectedReceiptBlock("double_size", event.target.checked);
+});
+el("receiptAddText").addEventListener("click", () => addReceiptBlock("text"));
+el("receiptAddSeparator").addEventListener("click", () => addReceiptBlock("separator"));
+el("receiptAddSpacer").addEventListener("click", () => addReceiptBlock("spacer"));
+el("receiptDeleteBlock").addEventListener("click", () => {
+  const index = receiptTemplate.blocks.findIndex((block) => block.id === selectedReceiptBlockId);
+  if (index < 0 || receiptTemplate.blocks[index].kind === "builtin") return;
+  rememberReceiptTemplate();
+  receiptTemplate.blocks.splice(index, 1);
+  selectedReceiptBlockId = receiptTemplate.blocks[Math.min(index, receiptTemplate.blocks.length - 1)]?.id || null;
+  receiptTemplateChanged();
+});
+el("receiptTemplateName").addEventListener("change", () => {
+  const value = el("receiptTemplateName").value.trim() || "自定义小票";
+  if (receiptTemplate.name === value) return;
+  rememberReceiptTemplate();
+  receiptTemplate.name = value;
+  receiptTemplateChanged();
+});
+el("receiptPaperWidth").addEventListener("change", () => {
+  const value = Number(el("receiptPaperWidth").value) || 48;
+  if (receiptTemplate.paper_width === value) return;
+  rememberReceiptTemplate();
+  receiptTemplate.paper_width = value;
+  receiptTemplateChanged();
+});
+el("receiptUndo").addEventListener("click", () => {
+  const previous = receiptHistory.pop();
+  if (!previous) return;
+  receiptTemplate = previous;
+  el("receiptTemplateName").value = receiptTemplate.name;
+  el("receiptPaperWidth").value = String(receiptTemplate.paper_width);
+  receiptTemplateChanged();
+  el("receiptUndo").disabled = receiptHistory.length === 0;
+});
+el("receiptSave").addEventListener("click", async () => {
+  receiptTemplate.name = el("receiptTemplateName").value.trim() || "自定义小票";
+  receiptTemplate.paper_width = Number(el("receiptPaperWidth").value) || 48;
+  setFeedback("receiptFeedback", "正在保存模板…", "warn");
+  try {
+    const result = await getJSON("/api/receipt-template", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(receiptTemplate),
+    });
+    receiptTemplate = result.template;
+    receiptHistory = [];
+    el("receiptUndo").disabled = true;
+    setReceiptDirty(false);
+    setFeedback("receiptFeedback", "模板已保存，下一张小票会使用新布局。", "success");
+  } catch (error) {
+    setFeedback("receiptFeedback", error.message || "保存失败", "error");
+  }
+});
+el("receiptReset").addEventListener("click", async () => {
+  if (!window.confirm("恢复默认小票布局？当前已保存的模板会被替换。")) return;
+  rememberReceiptTemplate();
+  try {
+    const result = await getJSON("/api/receipt-template", { method: "DELETE" });
+    receiptTemplate = result.template;
+    el("receiptTemplateName").value = receiptTemplate.name;
+    el("receiptPaperWidth").value = String(receiptTemplate.paper_width);
+    selectedReceiptBlockId = receiptTemplate.blocks?.[0]?.id || null;
+    selectReceiptBlock(selectedReceiptBlockId);
+    setReceiptDirty(false);
+    await previewReceiptTemplate();
+    setFeedback("receiptFeedback", "已恢复默认模板。", "success");
+  } catch (error) {
+    setFeedback("receiptFeedback", error.message || "恢复失败", "error");
+  }
+});
+
+loadReceiptEditor();

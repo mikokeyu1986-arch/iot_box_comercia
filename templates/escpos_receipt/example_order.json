@@ -1,0 +1,42 @@
+{
+  "name": "订单 00042",
+  "pos_reference": "订单 00042",
+  "tracking_number": "42",
+  "date_order": "2026-08-01 20:30:00",
+  "finalized": true,
+  "currency": {"symbol": "€", "position": "after"},
+  "company": {
+    "name": "示例餐厅",
+    "street": "Calle Ejemplo 1",
+    "zip": "35001",
+    "city": "Las Palmas",
+    "country_id": "España",
+    "phone": "+34 600 000 000"
+  },
+  "config": {
+    "name": "主收银台",
+    "receipt_language": "es_ES",
+    "receipt_footer": "谢谢惠顾\n欢迎再次光临"
+  },
+  "user_id": {"name": "收银员"},
+  "table_id": {"table_number": "A08"},
+  "lines": [
+    {
+      "qty": 2,
+      "full_product_name": "牛肉汉堡 (加芝士)",
+      "price_subtotal_incl": 17.0,
+      "unit_price": 8.5
+    },
+    {
+      "qty": 1,
+      "full_product_name": "可乐",
+      "price_subtotal_incl": 3.0,
+      "unit_price": 3.0
+    }
+  ],
+  "amountTaxes": 1.31,
+  "tax_names": ["IGIC 7%"],
+  "totalDue": 20.0,
+  "amountPaid": 20.0,
+  "payment_lines": [{"name": "现金", "amount": 20.0}]
+}
