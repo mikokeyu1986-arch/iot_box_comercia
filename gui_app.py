@@ -307,6 +307,8 @@ class SettingsWindow(tk.Toplevel):
                 return
             service_env = os.environ.copy()
             service_env["IOT_CONFIG_PATH"] = str(CONFIG_FILE)
+            # European thermal-printer code page with a real Euro symbol.
+            service_env["IOT_ESCPOS_ENCODING"] = "cp858"
             self._service_proc = subprocess.Popen(
                 [sys.executable, str(script)],
                 cwd=str(BASE_DIR),
@@ -403,9 +405,19 @@ class SettingsWindow(tk.Toplevel):
             self.after(1000, self._update_uptime)
 
     def _append_log(self, text: str) -> None:
+        # The GUI log is reserved for actionable failures.  Normal service
+        # output (startup, status, successful prints, health checks, etc.) is
+        # intentionally kept out of the panel so errors remain visible.
+        message = str(text or "")
+        error_markers = (
+            "error", "exception", "traceback", "failed", "failure",
+            "fatal", "critical", "stderr", "错误", "失败", "异常", "报错",
+        )
+        if not any(marker in message.casefold() for marker in error_markers):
+            return
         self.log_text.config(state="normal")
         ts = time.strftime("%H:%M:%S")
-        self.log_text.insert("end", f"[{ts}] {text}\n")
+        self.log_text.insert("end", f"[{ts}] {message}\n")
         self.log_text.see("end")
         self.log_text.config(state="disabled")
 
@@ -1363,7 +1375,7 @@ class TrayApplication:
 def main() -> None:
     """GUI 模式入口"""
     logging.basicConfig(
-        level=logging.INFO,
+        level=logging.ERROR,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     app = TrayApplication()
