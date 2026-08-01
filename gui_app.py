@@ -237,6 +237,10 @@ class SettingsWindow(tk.Toplevel):
 
     def _on_start(self) -> None:
         proto = self.proto_var.get()
+        port = HTTPS_PORT if proto == "https" else HTTP_PORT
+        if self._is_local_port_open(port):
+            # A service started outside this GUI is still a valid running service.
+            self._on_service_started(proto)
         self._append_log(f"正在以 {proto.upper()} 模式启动服务…")
         script = HTTP_SCRIPT if proto == "http" else HTTPS_SCRIPT
         threading.Thread(target=self._run_service, args=(script, proto), daemon=True).start()
@@ -1269,6 +1273,7 @@ class TrayApplication:
         self.config_store = ConfigStore(CONFIG_FILE)
         self.settings_window: SettingsWindow | None = None
         self._tray_icon = None
+        self.start_minimized = "--minimized" in sys.argv
 
     # ------------------------------------------------------------------
 
@@ -1325,7 +1330,11 @@ class TrayApplication:
         tray_thread.start()
 
         # 显示设置窗口
-        self._show_settings(master=root)
+        if self.start_minimized:
+            self.settings_window = SettingsWindow(root, self.config_store)
+            self.settings_window.withdraw()
+        else:
+            self._show_settings(master=root)
 
         # 主线程运行 tkinter 事件循环
         root.mainloop()
@@ -1336,7 +1345,11 @@ class TrayApplication:
         """降级模式：无托盘，纯窗口"""
         root = Tk()
         root.withdraw()  # 隐藏根窗口
-        self._show_settings(master=root)
+        if self.start_minimized:
+            self.settings_window = SettingsWindow(root, self.config_store)
+            self.settings_window.withdraw()
+        else:
+            self._show_settings(master=root)
         root.mainloop()
 
     # ------------------------------------------------------------------
@@ -1372,12 +1385,33 @@ class TrayApplication:
 # ============================================================================
 
 
+def _ensure_windows_startup_entry() -> None:
+    """Start the GUI in the notification area when Windows logs in."""
+    if platform.system() != "Windows":
+        return
+    try:
+        import winreg
+
+        launcher = BASE_DIR / "start_gui_hidden.vbs"
+        command = f'wscript.exe "{launcher}" --minimized'
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Run",
+            0,
+            winreg.KEY_SET_VALUE,
+        ) as key:
+            winreg.SetValueEx(key, "IoTBoxDesktop", 0, winreg.REG_SZ, command)
+    except Exception:
+        _logger.exception("Unable to register Windows startup entry")
+
+
 def main() -> None:
     """GUI 模式入口"""
     logging.basicConfig(
         level=logging.ERROR,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
+    _ensure_windows_startup_entry()
     app = TrayApplication()
     app.run()
 
