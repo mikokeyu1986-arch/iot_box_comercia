@@ -690,7 +690,7 @@ def build_receipt_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
     if total_due is not None:
         amt = _decimal(total_due)
         lines.append({
-            "text": f"{L['TOTAL']} {amt:.2f} EUR",
+            "text": f"{L['TOTAL']} {amt:.2f} €",
             "align": "center", "bold": True,
             "double_width": True, "double_height": True,
         })
@@ -740,13 +740,14 @@ def build_receipt_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
     # ══════════════════════════════════════════════════════════════════
     # 15. QR + Portal URL
     # ══════════════════════════════════════════════════════════════════
+    invoice_qr_lines = []
     if is_final:
         qr_src = _ticket_qr_src(order)
         ticket_code = _text(order.get("ticket_code"))
         if qr_src or ticket_code:
-            lines.append({"text": "", "align": "left"})
+            invoice_qr_lines.append({"text": "", "align": "left"})
         if qr_src:
-            lines.append({
+            invoice_qr_lines.append({
                 "type": "image", "src": qr_src, "align": "center",
                 "classes": ["portal-qr"],
                 "width": 180, "height": 180, "image_kind": "qr",
@@ -754,11 +755,14 @@ def build_receipt_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
         portal = _portal_url(order)
         url_mode = _text(order.get("company", {}).get("point_of_sale_ticket_portal_url_display_mode"))
         if portal and url_mode in ("url", "qr_code_and_url"):
-            lines.append({"text": portal, "align": "center", "classes": ["portal-url"]})
+            invoice_qr_lines.append({"text": portal, "align": "center", "classes": ["portal-url"]})
         if ticket_code:
-            lines.append({
+            invoice_qr_lines.append({
                 "text": f"{L['CODE']}: {ticket_code}",
                 "align": "center", "classes": ["unique-code"],
+            })
+            invoice_qr_lines.append({
+                "text": "", "align": "left", "classes": ["receipt-spacer", "after-unique-code"],
             })
 
     # ══════════════════════════════════════════════════════════════════
@@ -813,11 +817,15 @@ def build_receipt_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
         if total_due is not None:
             amt = _decimal(total_due)
             lines.append({
-                "text": f"TOTAL: {amt:.2f} EUR",
+                "text": f"TOTAL: {amt:.2f} €",
                 "align": "center", "bold": True,
                 "double_width": True, "double_height": True,
             })
         lines.append({"text": SEPARATOR, "align": "left"})
+
+    # Keep the invoice QR and related data as the final receipt content.
+    if invoice_qr_lines:
+        lines.extend(invoice_qr_lines)
 
     _logger.info(
         "Built receipt lines lang=%s lines=%s is_final=%s discount_total=%s",
