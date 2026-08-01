@@ -24,6 +24,8 @@ from .device_manager import DeviceManager
 from .event_bus import EventBus
 from .models import IoTEvent
 from .odoo_sync import OdooSyncService
+from .receipt_builder import build_receipt_lines
+from .receipt_template_store import load_template, reset_template, save_template, validate_template
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -1014,6 +1016,68 @@ async def api_settings(payload: dict[str, Any]) -> dict[str, Any]:
         connection=config_store.get_connection(),
     )
     return {"status": "success", "local_config": config, "sync_message": sync_message}
+
+
+def _receipt_preview_order() -> dict[str, Any]:
+    sample_path = BASE_DIR / "templates" / "escpos_receipt" / "example_order.json"
+    if sample_path.exists():
+        try:
+            return json.loads(sample_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {
+        "name": "Order 00042",
+        "pos_reference": "Order 00042",
+        "tracking_number": "42",
+        "date_order": "2026-08-01 20:30:00",
+        "finalized": True,
+        "currency": {"symbol": "€", "position": "after"},
+        "company": {"name": "示例餐厅", "street": "Calle Ejemplo 1", "city": "Las Palmas"},
+        "config": {"receipt_language": "zh_CN", "receipt_footer": "谢谢惠顾\n欢迎再次光临"},
+        "user_id": {"name": "收银员"},
+        "table_id": {"table_number": "A08"},
+        "lines": [
+            {"qty": 2, "full_product_name": "牛肉汉堡 (加芝士)", "price_subtotal_incl": 17},
+            {"qty": 1, "full_product_name": "可乐", "price_subtotal_incl": 3},
+        ],
+        "amountTaxes": 1.31,
+        "tax_names": ["IGIC 7%"],
+        "totalDue": 20,
+        "amountPaid": 20,
+        "payment_lines": [{"name": "现金", "amount": 20}],
+    }
+
+
+@app.get("/api/receipt-template")
+async def api_receipt_template() -> dict[str, Any]:
+    return {"status": "success", "template": load_template()}
+
+
+@app.put("/api/receipt-template")
+async def api_save_receipt_template(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        template = save_template(payload)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {"status": "success", "template": template}
+
+
+@app.delete("/api/receipt-template")
+async def api_reset_receipt_template() -> dict[str, Any]:
+    return {"status": "success", "template": reset_template()}
+
+
+@app.post("/api/receipt-template/preview")
+async def api_preview_receipt_template(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        template = validate_template(payload)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {
+        "status": "success",
+        "template": template,
+        "lines": build_receipt_lines(_receipt_preview_order(), template=template, preview_fields=True),
+    }
 
 
 

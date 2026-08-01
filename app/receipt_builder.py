@@ -43,7 +43,7 @@ _LABELS: dict[str, dict[str, str]] = {
         "CHANGE": "Cambio",
         "CODE": "Código",
         "NOTE": "Nota",
-        "QTY": "Ud.",
+        "QTY": "Uds.",
         "PRODUCT": "Producto",
         "AMOUNT": "Importe",
     },
@@ -66,6 +66,7 @@ _LABELS: dict[str, dict[str, str]] = {
     "zh_CN": {
         "TABLE": "桌号",
         "ORDER": "订单",
+        "SUBTOTAL": "小计",
         "DISCOUNT": "折扣",
         "TAX": "税额",
         "TOTAL": "合计",
@@ -506,7 +507,11 @@ def build_kitchen_ticket_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
 
 # ── main POS receipt builder ──────────────────────────────────────────
 
-def build_receipt_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
+def build_receipt_lines(
+    order: dict[str, Any],
+    template: dict[str, Any] | None = None,
+    preview_fields: bool = False,
+) -> list[dict[str, Any]]:
     """Build receipt lines from raw Odoo POS order JSON.
 
     All layout decisions are made here — the Odoo JS simply serialises
@@ -520,9 +525,14 @@ def build_receipt_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
     discount_total = _order_discount_total(order)
     config = order.get("config", {}) if isinstance(order.get("config"), dict) else {}
 
+    def mark_block(start: int, block_id: str) -> None:
+        for template_line in lines[start:]:
+            template_line["_template_block"] = block_id
+
     # ══════════════════════════════════════════════════════════════════
     # 1. Logo
     # ══════════════════════════════════════════════════════════════════
+    block_start = len(lines)
     logo_url = _text(config.get("receiptLogoUrl"))
     if logo_url:
         lines.append({
@@ -530,21 +540,26 @@ def build_receipt_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
             "classes": ["pos-receipt-logo"],
             "width": 480, "height": 150, "image_kind": "logo",
         })
+    mark_block(block_start, "logo")
 
     # ══════════════════════════════════════════════════════════════════
     # 2. Company
     # ══════════════════════════════════════════════════════════════════
+    block_start = len(lines)
     lines.extend(_company_lines(order))
+    mark_block(block_start, "company")
 
     # ══════════════════════════════════════════════════════════════════
     # 3. Customer
     # ══════════════════════════════════════════════════════════════════
+    block_start = len(lines)
     customer_info = _customer_lines(order)
     if customer_info:
         lines.extend(customer_info)
         lines.append({"text": "", "align": "left"})
 
     lines.append({"text": "", "align": "left", "classes": ["receipt-spacer"]})
+    mark_block(block_start, "customer")
 
     # ══════════════════════════════════════════════════════════════════
     # 4. Shared date+cashier info (used below table)
@@ -563,6 +578,7 @@ def build_receipt_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
     # ══════════════════════════════════════════════════════════════════
     # 5. Table / order marker
     # ══════════════════════════════════════════════════════════════════
+    block_start = len(lines)
     table = _table_text(order)
     order_marker = _tracking_text(order)
     if table or order_marker:
@@ -572,10 +588,12 @@ def build_receipt_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
             "double_width": True, "double_height": True,
         })
         lines.append({"text": "", "align": "left", "classes": ["receipt-spacer"]})
+    mark_block(block_start, "table")
 
     # ══════════════════════════════════════════════════════════════════
     # 6. Simplified invoice info (Factura Simplificada)
     # ══════════════════════════════════════════════════════════════════
+    block_start = len(lines)
     if is_final:
         order_name = _text(order.get("name"))
         seq_match = re.search(r"(\d+)$", order_name) if order_name else None
@@ -587,10 +605,12 @@ def build_receipt_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
             lines.append({"text": f"Fs/{current_year}/{seq_number}", "align": "center"})
             lines.append({"text": "*" * 26, "align": "center", "classes": ["invoice-asterisk-border"]})
             lines.append({"text": "", "align": "left", "classes": ["receipt-spacer"]})
+    mark_block(block_start, "invoice")
 
     # ══════════════════════════════════════════════════════════════════
     # 7. Reference + date + cashier (below table)
     # ══════════════════════════════════════════════════════════════════
+    block_start = len(lines)
     order_label = f"{L['ORDER']} {reference}" if reference else ""
     if order_label:
         lines.append({
@@ -606,10 +626,25 @@ def build_receipt_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
         lines.append({"text": "", "align": "left", "classes": ["receipt-spacer"]})
 
     lines.append({"text": "", "align": "left", "classes": ["receipt-spacer"]})
+    mark_block(block_start, "order_info")
 
     # ══════════════════════════════════════════════════════════════════
-    # 7. Product lines
+    # 8. Product column header
     # ══════════════════════════════════════════════════════════════════
+    block_start = len(lines)
+    lines.append({
+        "type": "product_header",
+        "qty_label": L["QTY"],
+        "product_label": L["PRODUCT"],
+        "amount_label": L["AMOUNT"],
+        "bold": True,
+    })
+    mark_block(block_start, "product_header")
+
+    # ══════════════════════════════════════════════════════════════════
+    # 9. Product lines
+    # ══════════════════════════════════════════════════════════════════
+    block_start = len(lines)
     for raw_line in order.get("lines", []):
         if not isinstance(raw_line, dict) or raw_line.get("combo_parent_id"):
             continue
@@ -627,7 +662,8 @@ def build_receipt_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
             "combo_items": options,
         }
         if discount_pct > 0:
-            entry["discount_text"] = f"{float(discount_pct):.0f}%"
+            percent_text = format(discount_pct.quantize(Decimal("0.01")), "f").rstrip("0").rstrip(".")
+            entry["discount_text"] = f"{percent_text}%"
         if original > 0:
             entry["original_total"] = _money(order, original)
         lines.append(entry)
@@ -641,10 +677,12 @@ def build_receipt_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
                 "text": f"  {L['NOTE']}: {note}",
                 "align": "left", "classes": ["customer-note"],
             })
+    mark_block(block_start, "products")
 
     # ══════════════════════════════════════════════════════════════════
     # 9. Spacer (replaces separator before Discount/Tax)
     # ══════════════════════════════════════════════════════════════════
+    block_start = len(lines)
     lines.append({"text": "", "align": "left", "classes": ["receipt-spacer"]})
 
     # ══════════════════════════════════════════════════════════════════
@@ -694,13 +732,14 @@ def build_receipt_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
             "align": "center", "bold": True,
             "double_width": True, "double_height": True,
         })
+    lines.append({"text": SEPARATOR, "align": "left"})
+    mark_block(block_start, "totals")
 
     # ══════════════════════════════════════════════════════════════════
     # 14. Payment section (final receipts only)
     # ══════════════════════════════════════════════════════════════════
+    block_start = len(lines)
     if is_final:
-        lines.append({"text": SEPARATOR, "align": "left"})
-
         # Individual payment lines (show payment method name instead of PAID label)
         payment_lines = order.get("payment_lines") or order.get("statement_ids") or []
         has_payment_line = False
@@ -736,6 +775,7 @@ def build_receipt_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
                     "left_text": L["CHANGE"],
                     "right_text": _money(order, change),
                 })
+    mark_block(block_start, "payments")
 
     # ══════════════════════════════════════════════════════════════════
     # 15. QR + Portal URL
@@ -768,16 +808,19 @@ def build_receipt_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
     # ══════════════════════════════════════════════════════════════════
     # 17. Footer
     # ══════════════════════════════════════════════════════════════════
+    block_start = len(lines)
     footer = _text(config.get("receipt_footer"))
     if footer:
         for fl in footer.split("\n"):
             fl = fl.strip()
             if fl:
                 lines.append({"text": fl, "align": "center", "classes": ["pos-config-name"]})
+    mark_block(block_start, "footer")
 
     # ══════════════════════════════════════════════════════════════════
     # 18. Takeout/Delivery info — LARGE, at the very bottom for tear-off
     # ══════════════════════════════════════════════════════════════════
+    block_start = len(lines)
     chino_order_type = _text(order.get("chino_order_type"))
     if chino_order_type == "DELIVERY":
         chino_floating = _text(order.get("chino_floating_order_name"))
@@ -822,16 +865,113 @@ def build_receipt_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
                 "double_width": True, "double_height": True,
             })
         lines.append({"text": SEPARATOR, "align": "left"})
+    mark_block(block_start, "delivery")
 
     # Keep the invoice QR and related data as the final receipt content.
     if invoice_qr_lines:
+        for invoice_qr_line in invoice_qr_lines:
+            invoice_qr_line["_template_block"] = "qr"
         lines.extend(invoice_qr_lines)
 
     _logger.info(
         "Built receipt lines lang=%s lines=%s is_final=%s discount_total=%s",
         lang, len(lines), is_final, float(discount_total),
     )
-    return lines
+    if preview_fields:
+        lines = _replace_with_field_placeholders(lines)
+    from .receipt_template_store import apply_template
+
+    return apply_template(lines, template)
+
+
+def _replace_with_field_placeholders(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Replace Odoo values with their source field names for the editor preview."""
+    placeholders: dict[str, list[dict[str, Any]]] = {
+        "logo": [{
+            "type": "image", "src": "{{ config.receiptLogoUrl }}", "align": "center",
+            "image_kind": "logo", "classes": ["pos-receipt-logo"],
+        }],
+        "company": [
+            {"text": "{{ company.name }}", "align": "center", "bold": True},
+            {"text": "{{ company.street }}", "align": "center"},
+            {"text": "{{ company.zip }} {{ company.city }}", "align": "center"},
+            {"text": "{{ company.country_id }}", "align": "center"},
+            {"text": "{{ company.phone }}", "align": "center"},
+        ],
+        "customer": [
+            {"text": "{{ partner_id.name }}", "align": "center"},
+            {"text": "{{ partner_id.pos_contact_address }}", "align": "center"},
+            {"text": "{{ partner_id.vat }}", "align": "center"},
+        ],
+        "table": [{
+            "text": "MESA {{ table_id.table_number }}", "align": "center", "bold": True,
+            "double_width": True, "double_height": True,
+        }],
+        "invoice": [
+            {"text": "**************************", "align": "center"},
+            {"text": "Factura Simplificada", "align": "center", "bold": True},
+            {"text": "Fs/{{ date_order.year }}/{{ name.sequence }}", "align": "center"},
+            {"text": "**************************", "align": "center"},
+        ],
+        "order_info": [
+            {"text": "PEDIDO {{ pos_reference }}", "align": "center", "bold": True},
+            {"text": "{{ date_order }} | {{ user_id.name }}", "align": "center"},
+        ],
+        "products": [{
+            "type": "product_line",
+            "qty": "qty",
+            "name": "full_product_name",
+            "total": "price_subtotal_incl",
+            "discount_text": "discount%",
+            "original_total": "price_without_discount",
+            "combo_items": ["orderDisplayProductName.attributeString"],
+        }],
+        "totals": [
+            {"type": "header_meta_line", "left_text": "Subtotal", "right_text": "{{ subtotal }}"},
+            {"type": "header_meta_line", "left_text": "Descuento", "right_text": "{{ discount_total }}"},
+            {"type": "header_meta_line", "left_text": "{{ tax_names[] }}", "right_text": "{{ amountTaxes }}"},
+            {"text": SEPARATOR, "align": "left"},
+            {"text": "TOTAL {{ totalDue }}", "align": "center", "bold": True,
+             "double_width": True, "double_height": True},
+            {"text": SEPARATOR, "align": "left"},
+        ],
+        "payments": [
+            {"type": "header_meta_line", "left_text": "{{ payment_lines[].name }}",
+             "right_text": "{{ payment_lines[].amount }}"},
+            {"type": "header_meta_line", "left_text": "Cambio", "right_text": "{{ change }}"},
+        ],
+        "footer": [{"text": "{{ config.receipt_footer }}", "align": "center"}],
+        "delivery": [
+            {"text": "{{ chino_order_type }}", "align": "center", "bold": True,
+             "double_width": True, "double_height": True},
+            {"text": "{{ partner_id.phone }}", "align": "center"},
+            {"text": "{{ partner_id.pos_contact_address }}", "align": "center"},
+        ],
+        "qr": [
+            {"type": "image", "src": "{{ ticket_qr_url }}", "align": "center",
+             "image_kind": "qr", "classes": ["portal-qr"]},
+            {"text": "{{ portal_url }}", "align": "center"},
+            {"text": "Código: {{ ticket_code }}", "align": "center"},
+        ],
+    }
+    seen: set[str] = set()
+    result: list[dict[str, Any]] = []
+    for line in lines:
+        block_id = str(line.get("_template_block") or "")
+        if block_id not in placeholders:
+            result.append(line)
+            continue
+        if block_id in seen:
+            continue
+        seen.add(block_id)
+        for placeholder in placeholders[block_id]:
+            result.append({**placeholder, "_template_block": block_id})
+    for block_id, block_lines in placeholders.items():
+        if block_id in seen:
+            continue
+        for placeholder in block_lines:
+            result.append({**placeholder, "_template_block": block_id})
+    return result
 
 
 # ── public dispatch ───────────────────────────────────────────────────
