@@ -380,16 +380,8 @@ async function loadScaleConfig() {
     el("scaleBrand").value = cfg.brand || "zfoc";
     el("scaleBaudrate").value = cfg.baudrate || 9600;
     el("scaleTimeout").value = cfg.timeout || 1.2;
-    const sseToggle = el("scaleSseEnabled");
-    if (sseToggle) sseToggle.checked = !!cfg.sse_enabled;
     el("scaleMonitorStatus").textContent = cfg.is_monitor_running ? "监控中" : "未运行";
     el("scaleMonitorStatus").style.color = cfg.is_monitor_running ? "#10B981" : "#94A3B8";
-    // 仅当配置开启 SSE 时才启动实时推送流，否则保持按需读取
-    if (cfg.sse_enabled) {
-      startScaleStream();
-    } else {
-      stopScaleStream();
-    }
     return cfg;
   } catch (_) {
     return null;
@@ -427,104 +419,13 @@ async function refreshScaleWeight() {
   }
 }
 
-// 实时电子秤重量推送（SSE）
-// 重量变化超过阈值时由服务端主动推送，替代旧的 2 秒轮询
-let scaleEventSource = null;
-let scaleReconnectTimer = null;
-let scalePollingFallback = null;
-
-function updateScaleWeightUI(weightKg, stable) {
-  el("scaleWeight").textContent = `${Number(weightKg).toFixed(3)} kg`;
-  el("scaleWeight").style.color = "#10B981";
-  const statusEl = el("scaleMonitorStatus");
-  if (statusEl) {
-    statusEl.textContent = stable ? "实时稳定" : "实时监控中";
-    statusEl.style.color = "#10B981";
-  }
-}
-
-function startScaleStream() {
-  if (typeof EventSource === "undefined") {
-    // 浏览器不支持 SSE，降级到 2 秒轮询
-    console.warn("EventSource not supported, falling back to polling");
-    if (!scalePollingFallback) {
-      scalePollingFallback = setInterval(refreshScaleWeight, 2000);
-    }
-    return;
-  }
-  if (scaleEventSource) {
-    scaleEventSource.close();
-  }
-  try {
-    scaleEventSource = new EventSource("/api/scale/stream");
-  } catch (error) {
-    console.warn("Scale EventSource init failed, retry in 5s:", error);
-    scheduleScaleReconnect();
-    return;
-  }
-  scaleEventSource.onopen = function () {
-    const statusEl = el("scaleMonitorStatus");
-    if (statusEl) {
-      statusEl.textContent = "实时连接已建立";
-      statusEl.style.color = "#10B981";
-    }
-  };
-  scaleEventSource.onmessage = function (event) {
-    try {
-      const data = JSON.parse(event.data);
-      if (data && data.weight_kg !== undefined && data.weight_kg !== null) {
-        updateScaleWeightUI(data.weight_kg, data.stable);
-      }
-    } catch (err) {
-      console.warn("Scale stream parse error:", err);
-    }
-  };
-  scaleEventSource.onerror = function () {
-    el("scaleWeight").style.color = "#94A3B8";
-    const statusEl = el("scaleMonitorStatus");
-    if (statusEl) {
-      statusEl.textContent = "实时连接断开，重连中...";
-      statusEl.style.color = "#F59E0B";
-    }
-    if (scaleEventSource) {
-      scaleEventSource.close();
-      scaleEventSource = null;
-    }
-    scheduleScaleReconnect();
-  };
-}
-
-function scheduleScaleReconnect() {
-  if (scaleReconnectTimer) return;
-  scaleReconnectTimer = setTimeout(() => {
-    scaleReconnectTimer = null;
-    startScaleStream();
-  }, 5000);
-}
-
-function stopScaleStream() {
-  if (scaleReconnectTimer) {
-    clearTimeout(scaleReconnectTimer);
-    scaleReconnectTimer = null;
-  }
-  if (scaleEventSource) {
-    scaleEventSource.close();
-    scaleEventSource = null;
-  }
-  if (scalePollingFallback) {
-    clearInterval(scalePollingFallback);
-    scalePollingFallback = null;
-  }
-}
-
 async function saveScaleConfig() {
-  const sseToggle = el("scaleSseEnabled");
   const payload = {
     scale_brand: el("scaleBrand").value,
     scale_port: el("scalePort").value,
     scale_baudrate: parseInt(el("scaleBaudrate").value) || 9600,
     scale_timeout: parseFloat(el("scaleTimeout").value) || 1.2,
-    scale_sse_enabled: sseToggle ? !!sseToggle.checked : false,
+    scale_sse_enabled: false,
   };
   await getJSON("/api/scale/save_config", {
     method: "POST",
@@ -562,20 +463,6 @@ el("scaleRefresh").addEventListener("click", async () => {
 });
 
 el("scaleReadWeight").addEventListener("click", refreshScaleWeight);
-
-// 电子秤默认按需读取（POS 模式）；仅当用户在配置中开启"实时推送"时
-// 才建立 SSE 连接。loadScaleConfig() 会根据配置自动启停 SSE 流。
-// 页面隐藏时暂停 SSE，可见时恢复（仅当 SSE 已启用时生效）
-document.addEventListener("visibilitychange", () => {
-  if (document.hidden) {
-    stopScaleStream();
-  } else {
-    // 仅在配置已开启 SSE 时恢复，否则保持按需读取
-    if (scaleEventSource || scalePollingFallback) {
-      startScaleStream();
-    }
-  }
-});
 
 const query = new URLSearchParams(window.location.search);
 if (query.get("token") && query.get("db_uuid")) {

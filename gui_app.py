@@ -595,18 +595,6 @@ class SettingsWindow(tk.Toplevel):
         ttk.Entry(row4, textvariable=self.scale_inter_command_delay_var, width=20).pack(side="left")
         ttk.Label(row4, text="主动探测之间的最小间隔", foreground="gray").pack(side="left", padx=5)
 
-        # 实时推送选项
-        opt_frame = ttk.LabelFrame(f, text="推送选项", padding=10)
-        opt_frame.pack(fill="x", padx=10, pady=10)
-        # Legacy SSE controls are kept internally but hidden from the GUI.
-
-        self.scale_sse_var = BooleanVar(value=False)
-        ttk.Checkbutton(opt_frame, text="启用 SSE 实时推送（本地 Web UI 显示秤盘跳动；POS 不需要）",
-                        variable=self.scale_sse_var).pack(anchor="w")
-        ttk.Label(opt_frame, text="POS 通过 EventBus 接收重量，无需开启 SSE。仅在本地 Web UI 需要实时显示时开启。",
-                  foreground="gray", font=("Segoe UI", 8)).pack(anchor="w")
-        opt_frame.pack_forget()
-
         # 按钮
         btn_frame = ttk.Frame(f)
         btn_frame.pack(fill="x", padx=10, pady=10)
