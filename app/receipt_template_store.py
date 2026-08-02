@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
+import shutil
+import threading
 import unicodedata
 from copy import deepcopy
 from pathlib import Path
@@ -31,6 +34,8 @@ ALIGNS = {"inherit", "left", "center", "right"}
 CUSTOM_KINDS = {"text", "separator", "spacer"}
 CUSTOM_ID = re.compile(r"^custom_[a-z0-9_-]{4,64}$")
 CONTENT_OVERRIDE_BLOCKS = {"company", "invoice", "order_info", "product_header", "footer"}
+_logger = logging.getLogger(__name__)
+_template_lock = threading.RLock()
 
 
 def default_template() -> dict[str, Any]:
@@ -182,21 +187,26 @@ def validate_template(payload: Any) -> dict[str, Any]:
 
 def load_template() -> dict[str, Any]:
     path = template_path()
-    if not path.exists():
-        return default_template()
-    try:
-        return validate_template(json.loads(path.read_text(encoding="utf-8")))
-    except Exception:
-        return default_template()
+    with _template_lock:
+        if not path.exists():
+            return default_template()
+        try:
+            return validate_template(json.loads(path.read_text(encoding="utf-8")))
+        except Exception:
+            _logger.exception("Invalid receipt template at %s; using defaults without overwriting it", path)
+            return default_template()
 
 
 def save_template(payload: Any) -> dict[str, Any]:
     template = validate_template(payload)
     path = template_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(template, ensure_ascii=False, indent=2), encoding="utf-8")
-    temporary.replace(path)
+    with _template_lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists():
+            shutil.copy2(path, path.with_suffix(path.suffix + ".bak"))
+        temporary = path.with_suffix(path.suffix + ".tmp")
+        temporary.write_text(json.dumps(template, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
     return deepcopy(template)
 
 

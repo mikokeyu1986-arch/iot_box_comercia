@@ -14,11 +14,9 @@ Supports:
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 import re
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlencode
 
@@ -387,6 +385,19 @@ def _portal_url(order: dict[str, Any]) -> str:
     return f"{base_url}/pos/ticket" if base_url else ""
 
 
+def _order_barcode_src(order: dict[str, Any]) -> str:
+    """Return Odoo's Code128 image URL for the receipt number."""
+    explicit_url = _text(order.get("order_barcode_url") or order.get("barcode_url"))
+    if explicit_url:
+        return explicit_url
+    config = order.get("config", {}) if isinstance(order.get("config"), dict) else {}
+    base_url = _text(config.get("_base_url") or order.get("_base_url")).rstrip("/")
+    reference = _text(order.get("pos_reference") or order.get("name"))
+    if not base_url or not reference:
+        return ""
+    return f"{base_url}/report/barcode?{urlencode({'barcode_type': 'Code128', 'value': reference, 'width': 420, 'height': 96})}"
+
+
 def _ticket_qr_src(order: dict[str, Any]) -> str:
     company = order.get("company", {}) if isinstance(order.get("company"), dict) else {}
     if not company.get("point_of_sale_use_ticket_qr_code") or not order.get("finalized") or not order.get("access_token"):
@@ -401,7 +412,11 @@ def _ticket_qr_src(order: dict[str, Any]) -> str:
 
 # ── kitchen ticket builder ────────────────────────────────────────────
 
-def build_kitchen_ticket_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
+def build_kitchen_ticket_lines(
+    order: dict[str, Any],
+    template: dict[str, Any] | None = None,
+    preview_fields: bool = False,
+) -> list[dict[str, Any]]:
     """Build a kitchen / preparation display ticket.
 
     Matches the auto-print style from _buildKitchenEscposLines() in the
@@ -418,23 +433,40 @@ def build_kitchen_ticket_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
     lang = _resolve_lang(order)
     L = _labels(lang)
 
+    def mark_block(start: int, block_id: str) -> None:
+        for template_line in lines[start:]:
+            template_line["_template_block"] = block_id
+
     # ── 1. Order type line ──
+    block_start = len(lines)
+    service_type = order.get("service_type") if isinstance(order.get("service_type"), dict) else {}
     chino_order_type = _text(order.get("chino_order_type"))
-    order_type = chino_order_type or "DINE IN"
+    order_type = _text(
+        service_type.get("label") or service_type.get("code")
+        or order.get("preset_name") or chino_order_type or "DINE IN"
+    )
     lines.append({
         "text": order_type,
         "align": "center", "bold": True,
         "double_width": True, "double_height": True,
     })
+    mark_block(block_start, "order_type")
 
-    # ── 2. "NUEVO" title (auto-print style) ──
+    # ── 2. Native kitchen notification: NUEVO, CANCELA, CAMBIO, etc. ──
+    block_start = len(lines)
+    changes = order.get("changes") if isinstance(order.get("changes"), dict) else {}
+    kitchen_title = _text(
+        order.get("kitchen_title") or changes.get("title") or order.get("title") or "NUEVO"
+    ).upper()
     lines.append({
-        "text": "NUEVO",
+        "text": kitchen_title,
         "align": "center", "bold": True,
         "double_width": True, "double_height": True,
     })
+    mark_block(block_start, "status")
 
     # ── 3. Tracking number + table ref (header_meta_line like auto-print) ──
+    block_start = len(lines)
     tracking = _text(order.get("tracking_number"))
     table = _table_text(order)
     left = f"# {tracking}" if tracking else ""
@@ -448,24 +480,73 @@ def build_kitchen_ticket_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
             "double_width": True,
             "double_height": True,
         })
+    mark_block(block_start, "order_meta")
 
+    block_start = len(lines)
     lines.append({"text": SEPARATOR, "align": "left"})
+    mark_block(block_start, "separator_before")
 
-    # ── 3. Product lines (qty x name) ──
-    for raw_line in order.get("lines", []):
+    # ── 4. Course-grouped product lines (qty × name; never receipt amount columns) ──
+    block_start = len(lines)
+
+    def course_name(group: dict[str, Any]) -> str:
+        course = group.get("course") or group.get("course_id") or group.get("courseId")
+        if isinstance(course, dict):
+            value = course.get("name") or course.get("display_name") or course.get("sequence_name")
+            if value:
+                return _text(value)
+        return _text(group.get("course_name") or group.get("courseName") or group.get("name"))
+
+    def group_items(group: dict[str, Any]) -> list[dict[str, Any]]:
+        result: list[dict[str, Any]] = []
+        seen_objects: set[int] = set()
+        stable_positions: dict[str, int] = {}
+        for key in ("items", "new", "cancelled", "noteUpdate", "data", "lines"):
+            values = group.get(key)
+            if not isinstance(values, list):
+                continue
+            for item in values:
+                if not isinstance(item, dict) or id(item) in seen_objects:
+                    continue
+                normalized = dict(item)
+                if key == "cancelled":
+                    normalized["_cancelled"] = True
+                stable_id = next(
+                    (
+                        str(normalized.get(field))
+                        for field in ("uuid", "id", "orderline_id", "line_id")
+                        if normalized.get(field) not in (None, "")
+                    ),
+                    "",
+                )
+                if stable_id and stable_id in stable_positions:
+                    existing = result[stable_positions[stable_id]]
+                    if normalized.get("_cancelled"):
+                        existing["_cancelled"] = True
+                    continue
+                if stable_id:
+                    stable_positions[stable_id] = len(result)
+                result.append(normalized)
+                seen_objects.add(id(item))
+        return result
+
+    def render_kitchen_item(raw_line: dict[str, Any]) -> None:
         if not isinstance(raw_line, dict):
-            continue
+            return
         qty = _qty_text(raw_line)
         name, options = _split_name_and_options(raw_line)
+        name = name or _text(raw_line.get("basic_name") or raw_line.get("name"))
         if not name:
-            continue
+            return
+        cancelled = bool(raw_line.get("_cancelled") or raw_line.get("cancelled"))
         lines.append({
             "type": "product_line",
             "qty": qty,
             "name": name,
             "total": "",
             "double_width": True,
-            "classes": ["kitchen-product-line"],
+            "kitchen_notification": "CANCELA" if cancelled else "",
+            "classes": ["kitchen-product-line"] + (["kitchen-cancelled-line"] if cancelled else []),
         })
         if options:
             for opt in options:
@@ -481,9 +562,37 @@ def build_kitchen_ticket_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
                 "align": "left", "bold": True,
                 "classes": ["kitchen-note"],
             })
+
+    raw_groups = order.get("course_groups")
+    if not isinstance(raw_groups, list) or not raw_groups:
+        raw_groups = changes.get("groupedData")
+    if isinstance(raw_groups, list) and raw_groups:
+        for group in raw_groups:
+            if not isinstance(group, dict):
+                continue
+            name = course_name(group)
+            if name:
+                lines.append({
+                    "text": f"** {name} **", "align": "center", "bold": True,
+                    "double_width": True, "double_height": True,
+                    "classes": ["kitchen-course-header"],
+                })
+            for raw_line in group_items(group):
+                render_kitchen_item(raw_line)
+    else:
+        flat_lines = order.get("lines")
+        if not isinstance(flat_lines, list) or not flat_lines:
+            flat_lines = changes.get("data") or []
+        for raw_line in flat_lines:
+            if isinstance(raw_line, dict):
+                render_kitchen_item(raw_line)
+    mark_block(block_start, "products")
+    block_start = len(lines)
     lines.append({"text": SEPARATOR, "align": "left"})
+    mark_block(block_start, "separator_after")
 
     # ── 5. Config name (shop/restaurant name, centered) ──
+    block_start = len(lines)
     config = order.get("config", {}) if isinstance(order.get("config"), dict) else {}
     config_name = _text(config.get("name") or order.get("pos_reference") or "")
     if not config_name:
@@ -491,18 +600,72 @@ def build_kitchen_ticket_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
         config_name = _text(company.get("name"))
     if config_name:
         lines.append({"text": config_name, "align": "center"})
+    mark_block(block_start, "location")
 
     # ── 6. Time (centered) ──
+    block_start = len(lines)
     date_text = _order_date_text(order)
     time_part = date_text[11:16] if len(date_text) >= 16 else date_text
     if time_part:
         lines.append({"text": time_part, "align": "center"})
+    mark_block(block_start, "time")
 
     _logger.info(
         "Built kitchen ticket lines=%s table=%s tracking=%s",
         len(lines), table or "<none>", tracking or "<none>",
     )
-    return lines
+    if preview_fields:
+        placeholders: dict[str, list[dict[str, Any]]] = {
+            "order_type": [{
+                "text": "{{ chino_order_type || 'DINE IN' }}", "align": "center", "bold": True,
+                "double_width": True, "double_height": True,
+            }],
+            "status": [{
+                "text": "{{ kitchen_title || changes.title || 'NUEVO' }}",
+                "align": "center", "bold": True,
+                "double_width": True, "double_height": True,
+            }],
+            "order_meta": [{
+                "type": "header_meta_line", "left_text": "# {{ tracking_number }}",
+                "right_text": "MESA {{ table_id.table_number }}", "bold": True,
+                "double_width": True, "double_height": True,
+            }],
+            "separator_before": [{"text": SEPARATOR, "align": "left"}],
+            "products": [
+                {
+                    "text": "** {{ course_groups[].course_name || changes.groupedData[].course.name }} **",
+                    "align": "center", "bold": True,
+                    "double_width": True, "double_height": True,
+                    "classes": ["kitchen-course-header"],
+                },
+                {
+                    "type": "product_line", "qty": "{{ course_groups[].items[].qty }}",
+                    "name": "{{ course_groups[].items[].full_product_name }}", "total": "",
+                    "double_width": True, "classes": ["kitchen-product-line"],
+                },
+                {"text": "+ {{ course_groups[].items[].orderDisplayProductName.attributeString }}", "align": "left"},
+                {"text": "NOTA: {{ course_groups[].items[].customer_note }}", "align": "left", "bold": True},
+            ],
+            "separator_after": [{"text": SEPARATOR, "align": "left"}],
+            "location": [{"text": "{{ config.name }}", "align": "center"}],
+            "time": [{"text": "{{ date_order.time }}", "align": "center"}],
+        }
+        seen: set[str] = set()
+        preview_lines: list[dict[str, Any]] = []
+        for line in lines:
+            block_id = str(line.get("_template_block") or "")
+            if block_id not in placeholders:
+                preview_lines.append(line)
+            elif block_id not in seen:
+                preview_lines.extend({**item, "_template_block": block_id} for item in placeholders[block_id])
+                seen.add(block_id)
+        for block_id, block_lines in placeholders.items():
+            if block_id not in seen:
+                preview_lines.extend({**item, "_template_block": block_id} for item in block_lines)
+        lines = preview_lines
+    from .kitchen_template_store import apply_kitchen_template
+
+    return apply_kitchen_template(lines, template)
 
 
 # ── main POS receipt builder ──────────────────────────────────────────
@@ -617,6 +780,19 @@ def build_receipt_lines(
             "text": order_label,
             "align": "center", "bold": True,
         })
+        barcode_src = _order_barcode_src(order)
+        if barcode_src:
+            lines.append({
+                "type": "image",
+                "src": barcode_src,
+                "align": "center",
+                "width": 420,
+                "height": 96,
+                "image_kind": "barcode",
+                "barcode_type": "Code128",
+                "barcode_value": reference,
+                "classes": ["receipt-order-barcode"],
+            })
     if info_text:
         lines.append({
             "text": info_text,
@@ -915,6 +1091,15 @@ def _replace_with_field_placeholders(lines: list[dict[str, Any]]) -> list[dict[s
         ],
         "order_info": [
             {"text": "PEDIDO {{ pos_reference }}", "align": "center", "bold": True},
+            {
+                "type": "image",
+                "src": "{{ pos_reference | barcode('Code128') }}",
+                "align": "center",
+                "image_kind": "barcode",
+                "barcode_type": "Code128",
+                "barcode_value": "{{ pos_reference }}",
+                "classes": ["receipt-order-barcode"],
+            },
             {"text": "{{ date_order }} | {{ user_id.name }}", "align": "center"},
         ],
         "products": [{

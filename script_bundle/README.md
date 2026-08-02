@@ -1,6 +1,7 @@
 # Restaurant Native Print IoT Box Runtime
 
-This is a local copy of your IoT Box runtime for the restaurant instance.
+This directory is a Windows deployment overlay, not a standalone application.
+Copy it over a complete checkout that contains the `app/` package.
 
 What is changed:
 - The web UI in `web/` is refactored.
@@ -18,6 +19,12 @@ Run example:
 
 ```powershell
 uvicorn app.main:app --host 0.0.0.0 --port 8398
+```
+
+Before publishing the overlay, refresh its canonical web and launcher files:
+
+```powershell
+python scripts/sync_script_bundle.py
 ```
 
 If you want this copy to use a different config path, set `IOT_CONFIG_PATH` before starting.

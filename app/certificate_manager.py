@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import secrets
 import shutil
 import ssl
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any
 
@@ -24,11 +26,12 @@ class CertificateManager:
         certs_dir: Path,
         *,
         iot_ip: str,
-        p12_password: str = "odoo",
+        p12_password: str = "",
     ) -> None:
         self.certs_dir = certs_dir
         self.iot_ip = iot_ip
         self.p12_password = p12_password
+        self.password_path = self.certs_dir / ".p12_password"
 
         self.key_path = self.certs_dir / "iotbox.key"
         self.crt_path = self.certs_dir / "iotbox.crt"
@@ -36,17 +39,37 @@ class CertificateManager:
 
     def ensure(self) -> None:
         self.certs_dir.mkdir(parents=True, exist_ok=True)
-        if self._is_existing_bundle_usable():
+        password_created = self._ensure_p12_password()
+        if not password_created and self._is_existing_bundle_usable():
             return
-        self._clear_existing_bundle()
+        # Generate the complete replacement before touching the active files.
+        # If OpenSSL/cryptography fails, the currently loaded HTTPS assets stay
+        # intact and the next startup can retry safely.
         self._generate_with_best_available()
 
     def status(self) -> dict[str, Any]:
         return {
             "crt_ready": self.crt_path.exists(),
             "p12_ready": self.p12_path.exists(),
-            "password_hint": self.p12_password,
+            "password_configured": bool(self.p12_password),
+            "password_file": str(self.password_path),
         }
+
+    def _ensure_p12_password(self) -> bool:
+        if self.p12_password:
+            return False
+        if self.password_path.exists():
+            value = self.password_path.read_text(encoding="utf-8").strip()
+            if value:
+                self.p12_password = value
+                return False
+        self.p12_password = secrets.token_urlsafe(18)
+        self.password_path.write_text(self.p12_password, encoding="utf-8")
+        try:
+            self.password_path.chmod(0o600)
+        except OSError:
+            pass
+        return True
 
     # ------------------------------------------------------------------
     # Generation strategy
@@ -118,10 +141,9 @@ class CertificateManager:
                 check=True, capture_output=True, text=True,
             )
 
-            # Move to final location
-            shutil.move(str(key_tmp), str(self.key_path))
-            shutil.move(str(crt_tmp), str(self.crt_path))
-            shutil.move(str(p12_tmp), str(self.p12_path))
+            os.replace(key_tmp, self.key_path)
+            os.replace(crt_tmp, self.crt_path)
+            os.replace(p12_tmp, self.p12_path)
 
     def _write_openssl_config(self, config_path: Path) -> None:
         san_entries = self._subject_alt_names()
@@ -214,22 +236,29 @@ class CertificateManager:
             .sign(key, _hashes.SHA256())
         )
 
-        self.key_path.write_bytes(
-            key.private_bytes(
-                encoding=_serialization.Encoding.PEM,
-                format=_serialization.PrivateFormat.TraditionalOpenSSL,
-                encryption_algorithm=_serialization.NoEncryption(),
-            )
+        key_data = key.private_bytes(
+            encoding=_serialization.Encoding.PEM,
+            format=_serialization.PrivateFormat.TraditionalOpenSSL,
+            encryption_algorithm=_serialization.NoEncryption(),
         )
-        self.crt_path.write_bytes(cert.public_bytes(_serialization.Encoding.PEM))
-
+        crt_data = cert.public_bytes(_serialization.Encoding.PEM)
         p12_data = _pkcs12.serialize_key_and_certificates(
             name=b"Custom IoT Box", key=key, cert=cert, cas=None,
             encryption_algorithm=_serialization.BestAvailableEncryption(
                 self.p12_password.encode("utf-8")
             ),
         )
-        self.p12_path.write_bytes(p12_data)
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            key_tmp = tmp_path / self.key_path.name
+            crt_tmp = tmp_path / self.crt_path.name
+            p12_tmp = tmp_path / self.p12_path.name
+            key_tmp.write_bytes(key_data)
+            crt_tmp.write_bytes(crt_data)
+            p12_tmp.write_bytes(p12_data)
+            os.replace(key_tmp, self.key_path)
+            os.replace(crt_tmp, self.crt_path)
+            os.replace(p12_tmp, self.p12_path)
 
     # ------------------------------------------------------------------
     # Helpers
@@ -250,6 +279,16 @@ class CertificateManager:
             cert = ssl._ssl._test_decode_cert(os.fspath(self.crt_path))
         except Exception:
             return False
+        not_after = str(cert.get("notAfter") or "").strip()
+        if not not_after:
+            return False
+        try:
+            # Renew before the final week instead of failing unexpectedly in
+            # the middle of a restaurant service.
+            if ssl.cert_time_to_seconds(not_after) <= time.time() + 7 * 86400:
+                return False
+        except (TypeError, ValueError, OverflowError):
+            return False
         subject_alt_names = cert.get("subjectAltName", ())
         wanted_host = self.iot_ip.split(":", 1)[0].strip()
         if not wanted_host:
@@ -266,7 +305,7 @@ def ensure_runtime_tls_assets(
     certs_dir: Path,
     *,
     iot_ip: str,
-    p12_password: str = "odoo",
+    p12_password: str = "",
 ) -> CertificateManager:
     manager = CertificateManager(
         certs_dir,

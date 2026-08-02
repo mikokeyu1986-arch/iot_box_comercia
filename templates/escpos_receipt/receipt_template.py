@@ -26,7 +26,11 @@ def render_text(lines: list[dict[str, Any]], width: int = 48) -> str:
             output.append("")
             continue
         if line_type == "image":
-            output.append(_align(f"[IMAGE: {line.get('src', '')}]", line.get("align"), width))
+            if line.get("image_kind") == "barcode":
+                value = line.get("barcode_value", "")
+                output.append(_align(f"[BARCODE Code128: {value}]", line.get("align"), width))
+            else:
+                output.append(_align(f"[IMAGE: {line.get('src', '')}]", line.get("align"), width))
             continue
         if line_type == "header_meta_line":
             output.append(_columns(line.get("left_text"), line.get("right_text"), width))

@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
+import ipaddress
 import json
 import logging
 import os
 import socket
-import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from xml.etree import ElementTree as ET
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -25,7 +27,15 @@ from .event_bus import EventBus
 from .models import IoTEvent
 from .odoo_sync import OdooSyncService
 from .receipt_builder import build_receipt_lines
+from .receipt_builder import build_kitchen_ticket_lines
+from .kitchen_template_store import (
+    load_kitchen_template,
+    reset_kitchen_template,
+    save_kitchen_template,
+    validate_kitchen_template,
+)
 from .receipt_template_store import load_template, reset_template, save_template, validate_template
+from .version import APP_VERSION
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -63,15 +73,12 @@ def _detect_local_ip() -> str:
 
 
 IOT_IP = _detect_local_ip()
-
-
-IOT_IP = _detect_local_ip()
-IOT_VERSION = os.getenv("IOT_VERSION", "2026.04.10")
+IOT_VERSION = os.getenv("IOT_VERSION", APP_VERSION)
 SPOOL_CLEAN_INTERVAL_SECONDS = int(os.getenv("IOT_SPOOL_CLEAN_INTERVAL_SECONDS", "1800"))
 SPOOL_RETENTION_SECONDS = int(os.getenv("IOT_SPOOL_RETENTION_SECONDS", "1800"))
 IOT_ENABLE_CLOUD_BRIDGE = os.getenv("IOT_ENABLE_CLOUD_BRIDGE", "1").strip().lower() in {"1", "true", "yes", "on"}
 IOT_SSL_VERIFY = os.getenv("IOT_SSL_VERIFY", "1").strip().lower() in {"1", "true", "yes", "on"}
-IOT_P12_PASSWORD = os.getenv("IOT_P12_PASSWORD", "odoo")
+IOT_P12_PASSWORD = os.getenv("IOT_P12_PASSWORD", "")
 
 _logger = logging.getLogger(__name__)
 _PRINT_ACTIONS = {"print_receipt", "print_receipt_escpos"}
@@ -104,15 +111,82 @@ def _perf_log(message: str) -> None:
         return
     print(message, flush=True)
 
-app = FastAPI(title="Restaurant Native Print IoT Box Runtime", version="0.1.0")
+app = FastAPI(title="Restaurant Native Print IoT Box Runtime", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _is_loopback_request(request: Request) -> bool:
+    host = request.client.host if request.client else ""
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host.lower() == "localhost"
+
+
+def _is_same_origin(request: Request) -> bool:
+    origin = request.headers.get("origin", "").strip()
+    if not origin:
+        return True
+    return urlsplit(origin).netloc.lower() == request.headers.get("host", "").lower()
+
+
+def _is_paired_odoo_origin(request: Request) -> bool:
+    origin = request.headers.get("origin", "").strip()
+    paired_url = str(config_store.get_connection().get("url") or "").strip()
+    if not origin or not paired_url:
+        return False
+    supplied = urlsplit(origin)
+    expected = urlsplit(paired_url)
+    return (supplied.scheme.lower(), supplied.netloc.lower()) == (
+        expected.scheme.lower(), expected.netloc.lower(),
+    )
+
+
+@app.middleware("http")
+async def protect_admin_api(request: Request, call_next):
+    """Keep the administration API local unless a shared token is supplied."""
+    configured_token = os.getenv("IOT_ADMIN_TOKEN", "").strip()
+    supplied_token = request.headers.get("x-iot-admin-token", "").strip()
+    token_ok = bool(configured_token) and hmac.compare_digest(configured_token, supplied_token)
+    local_ok = _is_loopback_request(request) and _is_same_origin(request)
+    if request.url.path.startswith("/api/"):
+        if not (local_ok or token_ok):
+            return JSONResponse(
+                status_code=403,
+                content={"status": "error", "detail": "Administration API is local-only"},
+            )
+    protected_device_paths = {
+        "/hw_proxy/print_xml_receipt",
+        "/hw_proxy/print_receipt",
+        "/hw_proxy/print_receipt_escpos",
+        "/hw_proxy/open_cashbox",
+        "/hw_proxy/open_cashbox_direct",
+    }
+    if request.url.path in protected_device_paths:
+        if not (local_ok or token_ok or _is_paired_odoo_origin(request)):
+            return JSONResponse(
+                status_code=403,
+                content={"status": "error", "detail": "Untrusted print origin"},
+            )
+    return await call_next(request)
 app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
+
+
+@app.get("/healthz")
+async def healthz(request: Request) -> dict[str, Any]:
+    """Lightweight readiness probe used by the desktop launcher."""
+    return {
+        "status": "ready",
+        "protocol": request.url.scheme,
+        "version": APP_VERSION,
+        "iot_ip": IOT_IP,
+    }
 
 event_bus = EventBus()
 config_store = ConfigStore(CONFIG_PATH)
@@ -161,11 +235,14 @@ async def startup_tasks() -> None:
         ssl_verify=IOT_SSL_VERIFY,
     )
     app.state.certificate_error = ""
-    try:
-        certificate_manager.ensure()
-    except Exception as exc:
-        app.state.certificate_error = str(exc)
-        _logger.exception("Certificate generation failed; continuing without downloadable certificates")
+    if str(config_store.get_local_config().get("ssl_engine") or "").strip() == "secure_https":
+        try:
+            # HTTPS startup already prepared this exact LAN certificate before
+            # Uvicorn loaded it. This is now a cheap consistency check only.
+            certificate_manager.ensure()
+        except Exception as exc:
+            app.state.certificate_error = str(exc)
+            _logger.exception("Certificate consistency check failed")
     app.state.spool_cleanup_task = asyncio.create_task(_spool_cleanup_loop())
     await device_manager.startup()
     if scale_service is not None:
@@ -476,7 +553,7 @@ async def iot_event(request: JsonRpcRequest) -> dict[str, Any]:
 
 @app.get("/api/status")
 async def api_status() -> dict[str, Any]:
-    server_connection = config_store.get_connection()
+    server_connection = config_store.get_public_connection()
     certificates = certificate_manager.status()
     certificates["startup_error"] = getattr(app.state, "certificate_error", "")
     devices = device_manager.device_list()
@@ -956,7 +1033,7 @@ async def api_connect(payload: dict[str, Any]) -> dict[str, Any]:
     )
     if IOT_ENABLE_CLOUD_BRIDGE:
         await cloud_bridge.request_reconnect(message="Odoo connection updated from /api/connect")
-    return {"status": "success", "server_connection": config_store.get_connection()}
+    return {"status": "success", "server_connection": config_store.get_public_connection()}
 
 
 @app.post("/api/disconnect")
@@ -1013,7 +1090,7 @@ async def api_settings(payload: dict[str, Any]) -> dict[str, Any]:
         update_fields=update_fields,
         sync_message=sync_message,
         devices=device_manager.device_list(),
-        connection=config_store.get_connection(),
+        connection=config_store.get_public_connection(),
     )
     return {"status": "success", "local_config": config, "sync_message": sync_message}
 
@@ -1080,6 +1157,40 @@ async def api_preview_receipt_template(payload: dict[str, Any]) -> dict[str, Any
     }
 
 
+@app.get("/api/kitchen-template")
+async def api_kitchen_template() -> dict[str, Any]:
+    return {"status": "success", "template": load_kitchen_template()}
+
+
+@app.put("/api/kitchen-template")
+async def api_save_kitchen_template(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        template = save_kitchen_template(payload)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {"status": "success", "template": template}
+
+
+@app.delete("/api/kitchen-template")
+async def api_reset_kitchen_template() -> dict[str, Any]:
+    return {"status": "success", "template": reset_kitchen_template()}
+
+
+@app.post("/api/kitchen-template/preview")
+async def api_preview_kitchen_template(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        template = validate_kitchen_template(payload)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {
+        "status": "success",
+        "template": template,
+        "lines": build_kitchen_ticket_lines(
+            _receipt_preview_order(), template=template, preview_fields=True,
+        ),
+    }
+
+
 
 @app.get("/api/devices")
 async def api_devices() -> dict[str, Any]:
@@ -1095,7 +1206,6 @@ async def api_scale_config() -> dict[str, Any]:
         "timeout": float(config.get("scale_timeout") or 1.2),
         "brand": str(config.get("scale_brand") or "zfoc"),
         "inter_command_delay": float(config.get("scale_inter_command_delay") or 0.05),
-        "sse_enabled": bool(config.get("scale_sse_enabled", False)),
         "is_monitor_running": scale_service.is_monitor_running if scale_service else False,
     }
 
@@ -1155,55 +1265,6 @@ async def api_scale_ports() -> dict[str, Any]:
         return {"status": "error", "message": str(exc)}
 
 
-@app.get("/api/scale/stream")
-async def api_scale_stream(request: Request) -> Any:
-    """SSE 端点：电子秤重量变化时实时推送给前端。
-
-    前端使用 ``new EventSource('/api/scale/stream')`` 订阅。
-    每当 ScaleMonitor 读到新重量且变化超过阈值时，推送一条 ``data:`` 事件。
-    无变化时每 15 秒发送心跳注释行保活。
-    """
-    if scale_service is None:
-        return {"status": "error", "message": "Scale service not available"}
-
-    queue = scale_service.subscribe()
-
-    async def event_generator():
-        try:
-            # 连接建立后立即推送一次当前缓存值（若存在），避免前端长时间空白
-            cached = scale_service.get_cached_weight(max_age=30.0)
-            if cached is not None:
-                initial_payload = {
-                    "status": "success",
-                    "weight_kg": round(cached, 3),
-                    "unit": "kg",
-                    "timestamp": time.time(),
-                    "stable": False,
-                }
-                yield f"data: {json.dumps(initial_payload, ensure_ascii=False)}\n\n"
-            while True:
-                if await request.is_disconnected():
-                    break
-                try:
-                    payload = await asyncio.wait_for(queue.get(), timeout=15.0)
-                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-                except asyncio.TimeoutError:
-                    # SSE 心跳注释行，防止代理/浏览器超时断开
-                    yield ": heartbeat\n\n"
-        finally:
-            scale_service.unsubscribe(queue)
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
 @app.post("/api/scale/save_config")
 async def api_scale_save_config(payload: dict[str, Any]) -> dict[str, Any]:
     update_fields: dict[str, Any] = {}
@@ -1217,8 +1278,6 @@ async def api_scale_save_config(payload: dict[str, Any]) -> dict[str, Any]:
         update_fields["scale_brand"] = str(payload.get("scale_brand", "zfoc")).strip().lower()
     if "scale_inter_command_delay" in payload:
         update_fields["scale_inter_command_delay"] = float(payload.get("scale_inter_command_delay", 0.05))
-    if "scale_sse_enabled" in payload:
-        update_fields["scale_sse_enabled"] = bool(payload.get("scale_sse_enabled", False))
     config = config_store.update_local_config(**update_fields)
     # 按需读取模式：保存配置后不自动启动监控
     # 监控会在 POS 打开称重界面（调用 read_once action）时自动启动

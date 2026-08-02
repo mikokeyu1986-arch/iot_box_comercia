@@ -7,30 +7,20 @@ from logging.handlers import RotatingFileHandler
 import os
 from pathlib import Path
 import shutil
-import subprocess
 import sys
 import traceback
 from urllib.parse import urlparse
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # pragma: no cover
-    tomllib = None
-
-os.environ.setdefault("IOT_SSL_VERIFY", "0")
+os.environ.setdefault("IOT_SSL_VERIFY", "1")
 
 
 BASE_DIR = Path(__file__).resolve().parent
 SPOOL_DIR = BASE_DIR / "spool"
-DEPENDENCY_FILE_CANDIDATES = (
-    BASE_DIR / "pyproject.toml",
-    BASE_DIR / "script_bundle" / "pyproject.toml",
-)
 REQUIRED_MODULES = {
     "uvicorn": "uvicorn[standard]>=0.35.0",
     "fastapi": "fastapi>=0.116.0",
     "pydantic": "pydantic>=2.0.0",
-    "websockets": "websockets>=16.0",
+    "websockets": "websockets>=15.0,<16.0",
     "PIL": "Pillow>=10.0.0",
     "cairosvg": "CairoSVG>=2.7.0",
     "qrcode": "qrcode>=8.0",
@@ -121,21 +111,6 @@ def _configure_logging() -> Path:
 LOG_DIR = _configure_logging()
 
 
-def _dependency_specs() -> list[str]:
-    for candidate in DEPENDENCY_FILE_CANDIDATES:
-        if not candidate.exists() or tomllib is None:
-            continue
-        try:
-            with candidate.open("rb") as handle:
-                data = tomllib.load(handle)
-        except Exception:
-            continue
-        dependencies = data.get("project", {}).get("dependencies", [])
-        if dependencies:
-            return [str(item) for item in dependencies]
-    return list(dict.fromkeys(REQUIRED_MODULES.values()))
-
-
 def _missing_dependency_specs() -> list[str]:
     missing_specs: list[str] = []
     for module_name, spec in REQUIRED_MODULES.items():
@@ -144,30 +119,23 @@ def _missing_dependency_specs() -> list[str]:
     return missing_specs
 
 
-def _install_missing_dependencies() -> None:
+def _require_runtime_dependencies() -> None:
+    if sys.version_info < (3, 10):
+        raise RuntimeError("Python 3.10 or newer is required")
     missing_specs = _missing_dependency_specs()
     if not missing_specs:
         return
-
-    install_specs = _dependency_specs()
-    print(f"Missing Python dependencies detected. Installing: {', '.join(missing_specs)}", flush=True)
-    try:
-        subprocess.run(
-            [sys.executable, "-m", "pip", "install", *install_specs],
-            check=True,
-            cwd=os.fspath(BASE_DIR),
-            timeout=120,
-        )
-    except Exception as exc:
-        print(f"WARNING: Failed to auto-install dependencies: {exc}", flush=True)
-        print(f"Please run manually: {sys.executable} -m pip install {' '.join(install_specs)}", flush=True)
+    missing = ", ".join(missing_specs)
+    raise RuntimeError(
+        f"Missing Python dependencies: {missing}. "
+        f"Install them with: {sys.executable} -m pip install -e {BASE_DIR}"
+    )
 
 
-_install_missing_dependencies()
+_require_runtime_dependencies()
 
 import uvicorn
 
-from app.certificate_manager import ensure_runtime_tls_assets
 from app.main import app, certificate_manager, config_store
 
 
@@ -278,23 +246,26 @@ def main() -> None:
         "port": port,
         "log_level": "info",
         "log_config": None,
-        "access_log": True,
+        "access_log": os.getenv("IOT_ACCESS_LOG", "0").strip().lower() in {"1", "true", "yes", "on"},
+        "timeout_keep_alive": max(5, int(os.getenv("IOT_HTTP_KEEP_ALIVE_SECONDS", "30"))),
+        "backlog": max(128, int(os.getenv("IOT_HTTP_BACKLOG", "2048"))),
     }
     if ssl_engine == "secure_https":
         _seed_runtime_certs()
         try:
-            manager = ensure_runtime_tls_assets(
-                certificate_manager.certs_dir,
-                iot_ip=f"127.0.0.1:{port}",
-                p12_password=os.getenv("IOT_P12_PASSWORD", "odoo"),
-            )
-            kwargs["ssl_keyfile"] = os.fspath(manager.key_path)
-            kwargs["ssl_certfile"] = os.fspath(manager.crt_path)
+            # Use the same manager and LAN identity as the FastAPI runtime.
+            # Generating a separate 127.0.0.1 certificate here caused the app
+            # startup hook to replace it after Uvicorn had already loaded it.
+            certificate_manager.ensure()
+            kwargs["ssl_keyfile"] = os.fspath(certificate_manager.key_path)
+            kwargs["ssl_certfile"] = os.fspath(certificate_manager.crt_path)
         except Exception as cert_exc:
             logger = logging.getLogger(__name__)
             logger.error("Certificate generation failed: %s", cert_exc)
-            logger.warning("Falling back to plain HTTP (no SSL). Certificates can be re-generated later via /api/regenerate-certs")
-            print(f"WARNING: Certificate generation failed ({cert_exc}), falling back to HTTP", flush=True)
+            # Never serve plain HTTP on the advertised HTTPS port. That makes
+            # clients retry TLS until their request times out and looks like a
+            # very slow print job.
+            raise RuntimeError("HTTPS certificate preparation failed") from cert_exc
     logging.getLogger(__name__).info("Starting IoT runtime host=%s port=%s log_dir=%s", host, port, LOG_DIR)
     uvicorn.run(app, **kwargs)
 
