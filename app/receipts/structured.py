@@ -8,6 +8,11 @@ from typing import Any
 from urllib.parse import urlencode
 
 from ..kitchen_template_store import apply_kitchen_template
+from ..receipt_builder import (
+    build_coupon_lines,
+    build_loyalty_lines,
+    build_promotion_lines,
+)
 from ..receipt_template_store import apply_template
 from ..printing.common import perf_log as _perf_log
 
@@ -16,7 +21,14 @@ _logger = logging.getLogger(__name__)
 class StructuredReceiptMixin:
     def _build_structured_receipt_lines(self, receipt: dict[str, Any]) -> list[dict[str, Any]]:
         lines: list[dict[str, Any]] = []
-        loyalty_cards = [card for card in (receipt.get("loyalty_cards") or []) if isinstance(card, dict)]
+        loyalty_cards = [
+            card for card in (receipt.get("loyalty_cards") or [])
+            if isinstance(card, dict)
+            and str(
+                card.get("program_type")
+                or ((card.get("program") or {}).get("program_type") if isinstance(card.get("program"), dict) else "")
+            ).lower() in {"", "gift_card", "ewallet"}
+        ]
         loyalty_card_names = {
             str(card.get("name") or "").strip().lower()
             for card in loyalty_cards
@@ -181,8 +193,13 @@ class StructuredReceiptMixin:
         customer_rows = [
             str(customer.get("name") or "").strip() if customer else "",
             str(customer.get("vat") or "").strip() if customer else "",
-            str(customer.get("address") or "").strip() if customer else "",
+            str(customer.get("pos_contact_address") or customer.get("address") or customer.get("street") or "").strip() if customer else "",
+            str(customer.get("street2") or "").strip() if customer else "",
             str(customer.get("region") or "").strip() if customer else "",
+            str(customer.get("country") or "").strip() if customer else "",
+            str(customer.get("phone") or "").strip() if customer else "",
+            str(customer.get("mobile") or "").strip() if customer else "",
+            str(customer.get("email") or "").strip() if customer else "",
         ]
         customer_rows = [text for text in customer_rows if text]
         if customer_rows:
@@ -339,21 +356,36 @@ class StructuredReceiptMixin:
         for receipt_item in receipt.get("payment_terminal_receipts") or []:
             if not isinstance(receipt_item, dict):
                 continue
-            # 禁止在刷卡小票中打印图片，只保留刷卡文字记录。
-            terminal_logo_src = ""
+            terminal_receipt_lines = self._iter_payment_terminal_receipt_lines(receipt_item)
+            logo = receipt_item.get("logo") if isinstance(receipt_item.get("logo"), dict) else {}
+            terminal_logo_src = str(
+                receipt_item.get("nfc_logo_src")
+                or receipt_item.get("nfcLogoSrc")
+                or receipt_item.get("contactless_logo_src")
+                or receipt_item.get("contactlessLogoSrc")
+                or logo.get("src")
+                or ""
+            ).strip()
+            is_contactless = bool(
+                receipt_item.get("contactless")
+                or receipt_item.get("is_contactless")
+                or receipt_item.get("nfc")
+                or any("CONTACTLESS" in text.upper() or "NFC" in text.upper() for text in terminal_receipt_lines)
+            )
+            if not terminal_logo_src and is_contactless:
+                terminal_logo_src = "/assets/nfc_override.png"
             if terminal_logo_src:
                 lines.append(
                     {
                         "type": "image",
                         "src": terminal_logo_src,
                         "align": "center",
-                        "classes": ["payment-terminal-logo"],
-                        # 只限制宽度，不固定高度，保持原始 PNG 比例。
-                        "width": 179,
+                        "classes": ["payment-terminal-logo", "payment-terminal-nfc-icon", "redsys-nfc-logo"],
+                        "width": 80,
                         "image_kind": "logo",
                     }
                 )
-            for text in self._iter_payment_terminal_receipt_lines(receipt_item):
+            for text in terminal_receipt_lines:
                 text = self._normalize_payment_terminal_line(text)
                 if text:
                     lines.append(
@@ -409,6 +441,10 @@ class StructuredReceiptMixin:
                             "classes": classes,
                         }
                     )
+
+        lines.extend(build_promotion_lines(receipt))
+        lines.extend(build_coupon_lines(receipt))
+        lines.extend(build_loyalty_lines(receipt))
 
         for loyalty_card in loyalty_cards:
             lines.append(
@@ -558,9 +594,26 @@ class StructuredReceiptMixin:
                 block = "products"
             elif "receipt-total" in classes or (first_product < index < first_payment):
                 block = "totals"
-            elif classes.intersection({"paymentlines", "payment-terminal-line", "pos-payment-terminal-receipt"}):
+            elif classes.intersection({"payment-terminal-line", "pos-payment-terminal-receipt", "payment-terminal-logo"}) \
+                    or any(value.startswith("redsys-") for value in classes):
+                block = "redsys"
+            elif "paymentlines" in classes:
                 block = "payments"
-            elif any(value.startswith("portal-") or value.startswith("gift-card-") for value in classes):
+            elif any(
+                value.startswith(("promotion-", "reward-", "buy-x-get-y-"))
+                for value in classes
+            ):
+                block = "promotions"
+            elif any(
+                value.startswith(("coupon-", "promo-code-", "next-order-coupon-"))
+                for value in classes
+            ):
+                block = "coupons"
+            elif any(value.startswith(("gift-card-", "ewallet-")) for value in classes):
+                block = "vouchers"
+            elif "loyalty" in classes or any(value.startswith("loyalty-") for value in classes):
+                block = "loyalty"
+            elif any(value.startswith("portal-") for value in classes):
                 block = "qr"
             elif "pos-config-name" in classes:
                 block = "footer"
@@ -576,25 +629,21 @@ class StructuredReceiptMixin:
             text = str((candidate or {}).get("text") or "").strip()
             return bool(text) and set(text) <= {"-", "="}
 
-        with_total_separators: list[dict[str, Any]] = []
+        # Odoo/native renderers may surround TOTAL with fixed separators.
+        # Remove only those adjacent separators; users can place separator
+        # blocks anywhere they want in the visual template.
+        without_total_separators: list[dict[str, Any]] = []
         for index, line in enumerate(tagged):
-            classes = {str(value) for value in line.get("classes") or []}
-            if "receipt-total" in classes:
-                separator = {
-                    "text": "-" * self._escpos_line_width(),
-                    "align": "left",
-                    "classes": ["receipt-separator", "template-total-separator"],
-                    "_template_block": "totals",
-                }
-                if not is_separator(with_total_separators[-1] if with_total_separators else None):
-                    with_total_separators.append(dict(separator))
-                with_total_separators.append(line)
-                next_line = tagged[index + 1] if index + 1 < len(tagged) else None
-                if not is_separator(next_line):
-                    with_total_separators.append(dict(separator))
-            else:
-                with_total_separators.append(line)
-        return apply_template(with_total_separators)
+            previous = tagged[index - 1] if index > 0 else None
+            following = tagged[index + 1] if index + 1 < len(tagged) else None
+            previous_classes = {str(value) for value in (previous or {}).get("classes") or []}
+            following_classes = {str(value) for value in (following or {}).get("classes") or []}
+            if is_separator(line) and (
+                "receipt-total" in previous_classes or "receipt-total" in following_classes
+            ):
+                continue
+            without_total_separators.append(line)
+        return apply_template(without_total_separators)
 
     def _apply_visual_template_to_kitchen_lines(
         self, lines: list[dict[str, Any]],
@@ -614,32 +663,60 @@ class StructuredReceiptMixin:
         )
         tagged: list[dict[str, Any]] = []
         order_type_assigned = False
+        legacy_location = ""
+        legacy_time = ""
         for index, source in enumerate(lines):
             line = dict(source)
             classes = {str(value) for value in line.get("classes") or []}
             text = str(line.get("text") or "").strip()
             if line.get("type") == "header_meta_line":
+                if "kitchen-location-time" in classes:
+                    line["_template_block"] = "location"
+                    tagged.append(line)
+                    continue
                 left = str(line.get("left_text") or "").strip()
                 right = str(line.get("right_text") or "").strip()
                 if left:
-                    tagged.append({**line, "right_text": "", "_template_block": "order_meta"})
-                if right:
                     tagged.append({
-                        "text": right,
+                        "text": left,
                         "align": "center",
                         "bold": bool(line.get("bold", True)),
                         "double_width": bool(line.get("double_width", False)),
                         "double_height": bool(line.get("double_height", True)),
-                        "_template_block": "status",
+                        "classes": ["kitchen-tracking-number"],
+                        "_template_block": "tracking",
                     })
+                if right:
+                    table_value = re.sub(r"^(?:MESA|TABLE)\s*", "", right, flags=re.IGNORECASE).strip()
+                    if table_value:
+                        tagged.append({
+                            "text": table_value,
+                            "align": "center",
+                            "bold": bool(line.get("bold", True)),
+                            "double_width": bool(line.get("double_width", False)),
+                            "double_height": bool(line.get("double_height", True)),
+                            "classes": ["kitchen-table-number"],
+                            "_template_block": "order_meta",
+                        })
                 continue
             if line.get("type") == "product_line" or "kitchen-note" in classes:
                 block = "products"
             elif text and set(text) <= {"-", "="}:
                 block = "separator_before" if index < first_product else "separator_after"
             elif "kitchen-footer" in classes:
-                block = "time" if re.fullmatch(r"\d{1,2}:\d{2}", text) else "location"
-            elif "MESA" in text.upper() or "TABLE" in text.upper() or text.startswith("#"):
+                if re.fullmatch(r"\d{1,2}:\d{2}", text):
+                    legacy_time = text
+                else:
+                    legacy_location = text
+                continue
+            elif text.startswith("#"):
+                block = "tracking"
+            elif "MESA" in text.upper() or "TABLE" in text.upper():
+                table_value = re.sub(r"^(?:MESA|TABLE)\s*", "", text, flags=re.IGNORECASE).strip()
+                if not table_value:
+                    continue
+                line["text"] = table_value
+                line["classes"] = list(classes | {"kitchen-table-number"})
                 block = "order_meta"
             elif index < first_product and not order_type_assigned and text:
                 block = "order_type"
@@ -652,6 +729,14 @@ class StructuredReceiptMixin:
                 block = "products"
             line["_template_block"] = block
             tagged.append(line)
+        if legacy_location or legacy_time:
+            tagged.append({
+                "type": "header_meta_line",
+                "left_text": legacy_location,
+                "right_text": legacy_time,
+                "classes": ["kitchen-footer", "kitchen-location-time"],
+                "_template_block": "location",
+            })
         return apply_kitchen_template(tagged)
 
     def _split_receipt_product_name_and_options(self, raw_name: str) -> tuple[str, list[str]]:

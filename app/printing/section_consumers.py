@@ -72,7 +72,7 @@ class ReceiptSectionConsumerMixin:
             if field_name == "point":
                 normalized_number = self._normalize_gift_card_amount(text)
                 if normalized_number:
-                    return field_name, self._format_amount_like("$ 0.00", self._parse_decimal(normalized_number) or Decimal("0"))
+                    return field_name, self._format_amount_like("0,00 €", self._parse_decimal(normalized_number) or Decimal("0"))
             normalized = self._normalize_gift_card_amount(text)
             if normalized:
                 return field_name, normalized

@@ -6,8 +6,11 @@ from pathlib import Path
 
 from app.receipt_builder import build_kitchen_ticket_lines, build_receipt_lines
 from app.kitchen_template_store import default_kitchen_template, save_kitchen_template
+from app.printing.product_parser import ProductParserMixin
+from app.printing.section_consumers import ReceiptSectionConsumerMixin
 from app.printing.text_layout import TextLayoutMixin
 from app.receipt_template_store import _cell_width, default_template, load_template, save_template, validate_template
+from app.receipts.structured import StructuredReceiptMixin
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +32,22 @@ class ReceiptTemplateTests(unittest.TestCase):
         )
         self.assertEqual(widths, (6, 30, 2, 10))
         self.assertEqual(sum(widths), 48)
+
+    def test_default_template_has_complete_independent_loyalty_suite(self):
+        template = validate_template(default_template())
+        block_ids = [block["id"] for block in template["blocks"]]
+
+        for block_id in ("promotions", "coupons", "vouchers", "loyalty"):
+            self.assertIn(block_id, block_ids)
+        self.assertIn("redsys", block_ids)
+        self.assertLess(block_ids.index("products"), block_ids.index("promotions"))
+        self.assertLess(block_ids.index("promotions"), block_ids.index("totals"))
+        self.assertLess(block_ids.index("payments"), block_ids.index("redsys"))
+        self.assertLess(block_ids.index("redsys"), block_ids.index("footer"))
+        self.assertLess(block_ids.index("footer"), block_ids.index("qr"))
+        self.assertLess(block_ids.index("qr"), block_ids.index("coupons"))
+        self.assertLess(block_ids.index("coupons"), block_ids.index("vouchers"))
+        self.assertLess(block_ids.index("vouchers"), block_ids.index("loyalty"))
 
     def test_default_escpos_encoding_prints_real_euro_glyph(self):
         class EncodingRenderer(TextLayoutMixin):
@@ -84,7 +103,7 @@ class ReceiptTemplateTests(unittest.TestCase):
         lines = build_receipt_lines(SAMPLE_ORDER)
         self.assertTrue(lines)
         self.assertFalse(any("_template_block" in line for line in lines))
-        self.assertTrue(any(line.get("text") == "示例餐厅" for line in lines))
+        self.assertFalse(any(line.get("text") == "示例餐厅" for line in lines))
         header = next(line for line in lines if "receipt-product-header" in line.get("classes", []))
         self.assertIn("Uds.", header["text"])
         self.assertIn("Producto", header["text"])
@@ -99,6 +118,19 @@ class ReceiptTemplateTests(unittest.TestCase):
         self.assertEqual(barcode.get("barcode_type"), "Code128")
         self.assertEqual(barcode.get("barcode_value"), SAMPLE_ORDER["pos_reference"])
         self.assertIn("barcode_type=Code128", barcode.get("src", ""))
+
+    def test_bundled_default_is_the_saved_visual_layout(self):
+        template = default_template()
+        block_ids = [block["id"] for block in template["blocks"]]
+        custom_blocks = [block for block in template["blocks"] if block["kind"] != "builtin"]
+
+        self.assertFalse(next(block for block in template["blocks"] if block["id"] == "company")["enabled"])
+        self.assertEqual(
+            (block_ids.index("payments"), block_ids.index("redsys"), block_ids.index("footer"), block_ids.index("qr")),
+            tuple(sorted((block_ids.index("payments"), block_ids.index("redsys"), block_ids.index("footer"), block_ids.index("qr")))),
+        )
+        self.assertEqual(sum(block["kind"] == "separator" for block in custom_blocks), 6)
+        self.assertEqual(sum(block["kind"] == "spacer" for block in custom_blocks), 2)
 
     def test_saved_template_hides_and_reorders_blocks(self):
         template = default_template()
@@ -149,6 +181,7 @@ class ReceiptTemplateTests(unittest.TestCase):
         template = default_template()
         header_block = next(block for block in template["blocks"] if block["id"] == "product_header")
         header_block.update({"qty_columns": 6, "product_columns": 20, "amount_columns": 10})
+        header_block.pop("gutter_columns", None)
 
         validated = validate_template(template)
         saved_header = next(block for block in validated["blocks"] if block["id"] == "product_header")
@@ -251,6 +284,318 @@ class ReceiptTemplateTests(unittest.TestCase):
         self.assertTrue(product_rows[0].rstrip().endswith("17,00 €"))
         self.assertEqual(total_line, "TOTAL 20,00 €")
 
+    def test_raw_order_voucher_prints_code_barcode_and_euro_balance(self):
+        order = {
+            **SAMPLE_ORDER,
+            "loyalty_cards": [{
+                "name": "Tarjeta regalo",
+                "code": "VALE-1234",
+                "point": "25,00",
+                "qrSrc": "data:image/png;base64,ignored",
+            }],
+        }
+        lines = build_receipt_lines(order, template=default_template())
+        voucher_lines = [
+            line for line in lines
+            if any(str(cls).startswith("gift-card-") for cls in line.get("classes", []))
+        ]
+
+        self.assertTrue(any(line.get("text") == "Tarjeta regalo" for line in voucher_lines))
+        self.assertTrue(any(line.get("text") == "VALE-1234" for line in voucher_lines))
+        barcode = next(line for line in voucher_lines if "gift-card-barcode" in line.get("classes", []))
+        self.assertEqual(barcode.get("barcode_value"), "VALE-1234")
+        self.assertIn("barcode_type=Code128", barcode.get("src", ""))
+        self.assertTrue(any(line.get("text") == "25,00 €" for line in voucher_lines))
+
+    def test_structured_voucher_and_portal_qr_use_separate_blocks(self):
+        class StructuredRenderer(StructuredReceiptMixin):
+            @staticmethod
+            def _escpos_line_width():
+                return 48
+
+        template = validate_template(default_template())
+        next(block for block in template["blocks"] if block["id"] == "vouchers")["enabled"] = False
+        next(block for block in template["blocks"] if block["id"] == "qr")["enabled"] = True
+        save_template(template)
+        source_lines = [
+            {"text": "VALE-1234", "classes": ["gift-card-code"]},
+            {"type": "image", "image_kind": "qr", "classes": ["portal-qr"]},
+        ]
+
+        lines = StructuredRenderer()._apply_visual_template_to_structured_lines(source_lines)
+
+        self.assertFalse(any("gift-card-code" in line.get("classes", []) for line in lines))
+        self.assertTrue(any("portal-qr" in line.get("classes", []) for line in lines))
+
+    def test_structured_total_drops_native_adjacent_separators(self):
+        class StructuredRenderer(StructuredReceiptMixin):
+            @staticmethod
+            def _escpos_line_width():
+                return 48
+
+        source_lines = [
+            {"text": "-" * 48, "classes": ["receipt-separator"]},
+            {"text": "TOTAL 20,00 €", "classes": ["receipt-total"]},
+            {"text": "-" * 48, "classes": ["receipt-separator"]},
+        ]
+
+        lines = StructuredRenderer()._apply_visual_template_to_structured_lines(source_lines)
+
+        self.assertTrue(any(line.get("text") == "TOTAL 20,00 €" for line in lines))
+        self.assertFalse(any("receipt-separator" in line.get("classes", []) for line in lines))
+
+    def test_redsys_terminal_record_is_an_independent_block(self):
+        order = {
+            **SAMPLE_ORDER,
+            "payment_terminal_receipts": [{
+                "lines": [
+                    "Tarjeta: VISA",
+                    "Auth Code: 123456",
+                    "Terminal: 00998877",
+                    "OPERACION CONTACTLESS. FIRMA NO NECESARIA.",
+                ],
+            }],
+        }
+
+        lines = build_receipt_lines(order, template=default_template())
+        redsys_lines = [line for line in lines if "redsys-receipt-line" in line.get("classes", [])]
+        nfc_logo = next(line for line in lines if "redsys-nfc-logo" in line.get("classes", []))
+
+        self.assertEqual(nfc_logo.get("src"), "/assets/nfc_override.png")
+        self.assertEqual(nfc_logo.get("width"), 80)
+        self.assertLess(lines.index(nfc_logo), lines.index(redsys_lines[0]))
+        self.assertEqual(
+            [line.get("text") for line in redsys_lines],
+            [
+                "Tarjeta: VISA", "Auth Code: 123456", "Terminal: 00998877",
+                "OPERACION CONTACTLESS. FIRMA NO NECESARIA.",
+            ],
+        )
+
+    def test_redsys_metadata_fallback_is_printed(self):
+        order = {
+            **SAMPLE_ORDER,
+            "payment_lines": [{
+                "name": "Tarjeta",
+                "amount": 20,
+                "card_type": "VISA",
+                "card_number": "************1234",
+                "authorization_code": "654321",
+                "transaction_id": "TX-99",
+                "terminal_id": "TERM-1",
+            }],
+        }
+
+        texts = [line.get("text") for line in build_receipt_lines(order, template=default_template())]
+
+        for expected in (
+            "Tarjeta: VISA", "Tarjeta nº: ************1234", "Autorización: 654321",
+            "Terminal: TERM-1", "Transacción: TX-99",
+        ):
+            self.assertIn(expected, texts)
+
+    def test_structured_redsys_can_be_hidden_without_hiding_payment_amount(self):
+        class StructuredRenderer(StructuredReceiptMixin):
+            @staticmethod
+            def _escpos_line_width():
+                return 48
+
+        template = default_template()
+        next(block for block in template["blocks"] if block["id"] == "redsys")["enabled"] = False
+        save_template(template)
+        source_lines = [
+            {"text": "Tarjeta 20,00 €", "classes": ["paymentlines"]},
+            {"type": "image", "src": "/assets/nfc_override.png", "classes": ["payment-terminal-nfc-icon", "redsys-nfc-logo"]},
+            {"text": "Auth Code: 123456", "classes": ["payment-terminal-line"]},
+        ]
+
+        lines = StructuredRenderer()._apply_visual_template_to_structured_lines(source_lines)
+
+        self.assertTrue(any("paymentlines" in line.get("classes", []) for line in lines))
+        self.assertFalse(any("redsys-nfc-logo" in line.get("classes", []) for line in lines))
+        self.assertFalse(any("payment-terminal-line" in line.get("classes", []) for line in lines))
+
+    def test_structured_voucher_points_use_euro_currency(self):
+        class VoucherRenderer(ReceiptSectionConsumerMixin, ProductParserMixin, TextLayoutMixin):
+            pass
+
+        field_name, amount = VoucherRenderer()._gift_card_display_amount({"point": "25,00"})
+
+        self.assertEqual(field_name, "point")
+        self.assertEqual(amount, "25,00 €")
+
+    def test_member_loyalty_points_are_not_currency(self):
+        order = {
+            **SAMPLE_ORDER,
+            "loyalty_points": [{
+                "couponId": 42,
+                "program": {"portal_visible": True},
+                "points": {
+                    "name": "Puntos Club",
+                    "won": 12.5,
+                    "spent": 3,
+                    "balance": 84,
+                    "total": 93.5,
+                },
+            }],
+        }
+
+        lines = build_receipt_lines(order, template=default_template())
+        loyalty_lines = [line for line in lines if "loyalty-points" in line.get("classes", [])]
+
+        self.assertEqual(
+            [(line["left_text"], line["right_text"]) for line in loyalty_lines],
+            [
+                ("Puntos Club Ganados", "12,5"),
+                ("Puntos Club Utilizados", "3"),
+                ("Saldo Puntos Club", "84"),
+            ],
+        )
+        self.assertFalse(any("€" in line["right_text"] for line in loyalty_lines))
+
+    def test_complete_customer_information_is_rendered(self):
+        order = {
+            **SAMPLE_ORDER,
+            "partner_id": {
+                "parent_name": "Empresa Matriz",
+                "name": "Ana García",
+                "vat": "ES12345678A",
+                "street": "Calle Mayor 10",
+                "street2": "Local 2",
+                "zip": "35001",
+                "city": "Las Palmas",
+                "state_id": {"name": "Las Palmas"},
+                "country_id": {"name": "España"},
+                "phone": "928000001",
+                "mobile": "600000001",
+                "email": "ana@example.com",
+            },
+        }
+
+        lines = build_receipt_lines(order, template=default_template())
+        customer_texts = [
+            line.get("text") for line in lines
+            if "customer-info" in line.get("classes", [])
+        ]
+
+        for expected in (
+            "Empresa Matriz, Ana García", "ES12345678A", "Calle Mayor 10", "Local 2",
+            "35001 Las Palmas Las Palmas", "España", "928000001", "600000001", "ana@example.com",
+        ):
+            self.assertIn(expected, customer_texts)
+
+    def test_customer_alias_is_supported_when_partner_id_is_absent(self):
+        order = {**SAMPLE_ORDER, "partner_id": None, "customer": {"name": "Cliente mostrador", "phone": "123"}}
+
+        lines = build_receipt_lines(order, template=default_template())
+        texts = [line.get("text") for line in lines]
+
+        self.assertIn("Cliente mostrador", texts)
+        self.assertIn("123", texts)
+
+    def test_new_coupon_info_is_rendered_in_independent_coupon_block(self):
+        order = {
+            **SAMPLE_ORDER,
+            "new_coupon_info": [{
+                "program_name": "Cupón próxima visita",
+                "code": "CUPON-5678",
+                "expiration_date": "2026-12-31",
+            }],
+        }
+
+        lines = build_receipt_lines(order, template=default_template())
+        texts = [line.get("text") for line in lines]
+
+        self.assertIn("Cupón próxima visita", texts)
+        self.assertIn("CUPON-5678", texts)
+        self.assertIn("Hasta: 2026-12-31", texts)
+        coupon_lines = [
+            line for line in lines
+            if any(str(value).startswith("coupon-") for value in line.get("classes", []))
+        ]
+        self.assertTrue(any("coupon-code" in line.get("classes", []) for line in coupon_lines))
+        self.assertFalse(any("gift-card-code" in line.get("classes", []) for line in coupon_lines))
+
+    def test_reward_line_populates_promotions_block(self):
+        order = {
+            **SAMPLE_ORDER,
+            "lines": [{
+                "qty": 1,
+                "full_product_name": "Descuento club",
+                "price_subtotal_incl": -5,
+                "is_reward_line": True,
+                "points_cost": 20,
+                "reward_identifier_code": "PROMO-20",
+                "reward_id": {
+                    "name": "20% socios",
+                    "reward_type": "discount",
+                    "program_id": {"name": "Club Restaurante"},
+                },
+            }],
+        }
+
+        lines = build_receipt_lines(order, template=default_template())
+        promotion_lines = [
+            line for line in lines
+            if any(str(value).startswith("promotion-") for value in line.get("classes", []))
+        ]
+
+        self.assertTrue(any(line.get("text") == "20% socios" for line in promotion_lines))
+        self.assertTrue(any(line.get("text") == "Club Restaurante" for line in promotion_lines))
+        self.assertTrue(any("20 pts" in line.get("text", "") for line in promotion_lines))
+        self.assertTrue(any(line.get("text") == "PROMO-20" for line in promotion_lines))
+
+    def test_four_loyalty_modules_can_be_hidden_independently(self):
+        order = {
+            **SAMPLE_ORDER,
+            "promotions": [{"name": "Promo visible", "reward_type": "discount", "amount": -2}],
+            "new_coupon_info": [{"program_name": "Cupón visible", "code": "C-1"}],
+            "loyalty_cards": [{"name": "Tarjeta visible", "code": "G-1", "balance": 15}],
+            "loyalty_points": [{"points": {"name": "Puntos", "won": 5, "balance": 5}}],
+        }
+        template = default_template()
+        next(block for block in template["blocks"] if block["id"] == "coupons")["enabled"] = False
+
+        lines = build_receipt_lines(order, template=template)
+        texts = [line.get("text") for line in lines]
+
+        self.assertIn("Promo visible", texts)
+        self.assertNotIn("Cupón visible", texts)
+        self.assertIn("Tarjeta visible", texts)
+        self.assertTrue(any("loyalty-points" in line.get("classes", []) for line in lines))
+
+    def test_odoo_program_types_are_routed_to_the_correct_modules(self):
+        order = {
+            **SAMPLE_ORDER,
+            "loyalty_cards": [
+                {"name": "Gift", "code": "G-1", "program_type": "gift_card"},
+                {"name": "Not a gift", "code": "P-1", "program_type": "promo_code"},
+            ],
+            "coupons": [
+                {"name": "Discount code", "code": "C-1", "program_type": "promo_code"},
+                {"name": "Not a coupon", "code": "G-2", "program_type": "gift_card"},
+            ],
+            "promotions": [
+                {"name": "Buy X Get Y", "program_type": "buy_x_get_y"},
+                {"name": "Not a promotion", "program_type": "ewallet"},
+            ],
+            "loyalty_points": [
+                {"program": {"program_type": "loyalty"}, "points": {"name": "Club", "won": 2}},
+                {"program": {"program_type": "gift_card"}, "points": {"name": "Money", "won": 9}},
+            ],
+        }
+
+        rendered = build_receipt_lines(order, template=default_template())
+        texts = [line.get("text") for line in rendered]
+
+        for expected in ("Gift", "Discount code", "Buy X Get Y"):
+            self.assertIn(expected, texts)
+        for excluded in ("Not a gift", "Not a coupon", "Not a promotion"):
+            self.assertNotIn(excluded, texts)
+        loyalty_labels = [line.get("left_text") for line in rendered if "loyalty-points" in line.get("classes", [])]
+        self.assertIn("Club Ganados", loyalty_labels)
+        self.assertNotIn("Money Ganados", loyalty_labels)
+
     def test_comma_decimal_quantity_and_total_are_preserved(self):
         order = {
             **SAMPLE_ORDER,
@@ -276,19 +621,45 @@ class ReceiptTemplateTests(unittest.TestCase):
         self.assertTrue(product.rstrip().endswith("100,00 €"))
         self.assertEqual(total, "TOTAL 100,00 €")
 
-    def test_editor_preview_uses_field_names_and_total_owns_both_separators(self):
-        lines = build_receipt_lines(SAMPLE_ORDER, template=default_template(), preview_fields=True)
+    def test_editor_preview_uses_field_names_and_total_has_no_fixed_separators(self):
+        template = default_template()
+        next(block for block in template["blocks"] if block["id"] == "company")["enabled"] = True
+        lines = build_receipt_lines(SAMPLE_ORDER, template=template, preview_fields=True)
         texts = [line.get("text", "") for line in lines]
         total_index = texts.index("TOTAL {{ totalDue }}")
 
         self.assertIn("{{ company.name }}", texts)
         self.assertIn("{{ config.receipt_footer }}", texts)
+        self.assertIn("{{ partner_id.vat }}", texts)
+        self.assertIn("{{ partner_id.phone }} / {{ partner_id.mobile }}", texts)
+        self.assertIn("{{ partner_id.email }}", texts)
+        self.assertIn("{{ loyalty_cards[].name }}", texts)
+        self.assertIn("{{ loyalty_cards[].code }}", texts)
+        self.assertIn("{{ loyalty_cards[].balance }}", texts)
+        self.assertIn("{{ loyalty_cards[].point }}", texts)
+        self.assertIn("{{ loyalty_cards[].qrSrc }}", texts)
+        self.assertIn("{{ loyalty_cards[].program_type }}", texts)
+        self.assertIn("{{ new_coupon_info[].program_name }}", texts)
+        self.assertIn("{{ new_coupon_info[].code }}", texts)
+        self.assertIn("{{ new_coupon_info[].expiration_date }}", texts)
+        self.assertIn("{{ coupons[].program_type }}", texts)
+        self.assertIn("{{ lines[].reward_id.name }}", texts)
+        self.assertIn("{{ lines[].reward_id.program_id.name }}", texts)
+        self.assertIn("{{ payment_terminal_receipts[].lines[] }}", texts)
+        self.assertIn("{{ payment_lines[].authorization_code }} / {{ payment_lines[].transaction_id }}", texts)
+        self.assertTrue(any("redsys-nfc-logo" in line.get("classes", []) for line in lines))
+        self.assertIn("{{ loyalty_points[].points.total }}", texts)
+        loyalty_preview = [line for line in lines if "loyalty-points" in line.get("classes", [])]
+        self.assertTrue(any("points.won" in line.get("right_text", "") for line in loyalty_preview))
+        self.assertTrue(any("points.spent" in line.get("right_text", "") for line in loyalty_preview))
+        self.assertTrue(any("points.balance" in line.get("right_text", "") for line in loyalty_preview))
         order_label_index = texts.index("PEDIDO {{ pos_reference }}")
         barcode = lines[order_label_index + 1]
         self.assertEqual(barcode.get("image_kind"), "barcode")
         self.assertEqual(barcode.get("barcode_value"), "{{ pos_reference }}")
-        self.assertEqual(texts[total_index - 1], "-" * 48)
-        self.assertEqual(texts[total_index + 1], "-" * 48)
+        for neighbor in (lines[total_index - 1], lines[total_index + 1]):
+            if neighbor.get("text") == "-" * 48:
+                self.assertIn("template-custom-separator", neighbor.get("classes", []))
         product_row = next(line for line in lines if "receipt-product-row" in line.get("classes", []))
         self.assertIn("qty", product_row["text"])
         self.assertIn("full_product_name", product_row["text"])
@@ -328,32 +699,59 @@ class ReceiptTemplateTests(unittest.TestCase):
             SAMPLE_ORDER, template=default_kitchen_template(), preview_fields=True,
         )
         texts = [str(line.get("text") or "") for line in lines]
-        meta = next(line for line in lines if line.get("type") == "header_meta_line")
         product = next(line for line in lines if line.get("type") == "product_line")
 
-        self.assertEqual(texts[0], "{{ chino_order_type || 'DINE IN' }}")
-        self.assertEqual(texts[1], "{{ kitchen_title || changes.title || 'NUEVO' }}")
-        self.assertEqual(meta["left_text"], "# {{ tracking_number }}")
-        self.assertEqual(meta["right_text"], "MESA {{ table_id.table_number }}")
+        self.assertEqual(texts[0], "# {{ tracking_number }}")
+        self.assertEqual(texts[1], "{{ chino_order_type || 'DINE IN' }}")
+        self.assertEqual(texts[2], "{{ kitchen_title || changes.title || 'NUEVO' }}")
+        self.assertEqual(texts[3], "{{ table_id.table_number }}")
+        self.assertFalse(any("MESA" in text for text in texts))
         self.assertEqual(product["qty"], "{{ course_groups[].items[].qty }}")
         self.assertEqual(product["name"], "{{ course_groups[].items[].full_product_name }}")
         self.assertTrue(any("course_groups[].course_name" in text for text in texts))
-        self.assertIn("{{ config.name }}", texts)
-        self.assertIn("{{ date_order.time }}", texts)
+        footer_meta = next(
+            line for line in lines
+            if "kitchen-location-time" in line.get("classes", [])
+        )
+        self.assertEqual(footer_meta["left_text"], "{{ config.name }}")
+        self.assertEqual(footer_meta["right_text"], "{{ date_order.time }}")
+
+    def test_kitchen_tracking_is_top_and_table_has_no_prompt_word(self):
+        lines = build_kitchen_ticket_lines(SAMPLE_ORDER, template=default_kitchen_template())
+
+        self.assertEqual(lines[0].get("text"), "# 42")
+        self.assertIn("kitchen-tracking-number", lines[0].get("classes", []))
+        table_line = next(line for line in lines if "kitchen-table-number" in line.get("classes", []))
+        self.assertEqual(table_line.get("text"), "A08")
+        self.assertNotIn("MESA", table_line.get("text", ""))
+
+    def test_delivery_kitchen_ticket_keeps_table_value_without_mesa_prompt(self):
+        order = {
+            **SAMPLE_ORDER,
+            "chino_order_type": "DELIVERY",
+            "table_id": {"table_number": "A08"},
+        }
+
+        lines = build_kitchen_ticket_lines(order, template=default_kitchen_template())
+        texts = [str(line.get("text") or "") for line in lines]
+
+        self.assertIn("DELIVERY", texts)
+        self.assertIn("A08", texts)
+        self.assertFalse(any("MESA" in text for text in texts))
 
     def test_saved_kitchen_template_hides_and_reorders_blocks(self):
         template = default_kitchen_template()
         next(block for block in template["blocks"] if block["id"] == "status")["enabled"] = False
-        time_block = next(block for block in template["blocks"] if block["id"] == "time")
-        template["blocks"].remove(time_block)
-        template["blocks"].insert(0, time_block)
+        location_block = next(block for block in template["blocks"] if block["id"] == "location")
+        template["blocks"].remove(location_block)
+        template["blocks"].insert(0, location_block)
         save_kitchen_template(template)
 
         lines = build_kitchen_ticket_lines(SAMPLE_ORDER)
-        texts = [str(line.get("text") or "") for line in lines]
-
-        self.assertEqual(texts[0], "20:30")
-        self.assertNotIn("NUEVO", texts)
+        self.assertEqual(lines[0].get("type"), "header_meta_line")
+        self.assertEqual(lines[0].get("left_text"), "主收银台")
+        self.assertEqual(lines[0].get("right_text"), "20:30")
+        self.assertFalse(any(line.get("text") == "NUEVO" for line in lines))
 
     def test_kitchen_notification_and_course_sequence_have_no_receipt_columns(self):
         order = {
@@ -380,7 +778,7 @@ class ReceiptTemplateTests(unittest.TestCase):
         texts = [str(line.get("text") or "") for line in lines]
         products = [line for line in lines if line.get("type") == "product_line"]
 
-        self.assertEqual(texts[1], "CANCELA")
+        self.assertIn("CANCELA", texts)
         self.assertIn("** 1º ENTRANTES **", texts)
         self.assertIn("** 2º PRINCIPALES **", texts)
         self.assertEqual([line["name"] for line in products], ["Ensalada", "Paella"])

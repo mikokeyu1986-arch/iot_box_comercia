@@ -286,9 +286,11 @@ conn = psycopg2.connect(host='localhost', port=5432, dbname='odoo19_dev', user='
 cur = conn.cursor()
 cur.execute(
     '''
-    SELECT rp.name, rp.vat, rp.street, rp.city, rp.zip
+    SELECT rp.name, rp.vat, rp.street, rp.street2, rp.city, rp.zip,
+           rp.phone, rp.mobile, rp.email, rc.name
     FROM pos_order po
     LEFT JOIN res_partner rp ON rp.id = po.partner_id
+    LEFT JOIN res_country rc ON rc.id = rp.country_id
     WHERE po.pos_reference = %s
     ORDER BY po.id DESC
     LIMIT 1
@@ -301,13 +303,18 @@ conn.close()
 if not row:
     print('{}')
 else:
-    name, vat, street, city, zip_code = row
+    name, vat, street, street2, city, zip_code, phone, mobile, email, country = row
     region = ', '.join([item for item in [city, zip_code] if item])
     print(json.dumps({
         'name': name or '',
         'vat': vat or '',
         'address': street or '',
+        'street2': street2 or '',
         'region': region,
+        'country': country or '',
+        'phone': phone or '',
+        'mobile': mobile or '',
+        'email': email or '',
     }))
 """
         try:

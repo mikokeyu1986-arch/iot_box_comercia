@@ -16,17 +16,17 @@ from .receipt_template_store import _apply_horizontal_offset
 
 
 BLOCKS = (
+    ("tracking", "取餐号（顶部）"),
     ("order_type", "订单类型"),
     ("status", "菜品通知（NUEVO / CANCELA）"),
-    ("order_meta", "订单号 / 桌号"),
+    ("order_meta", "桌号（仅显示字段值）"),
     ("separator_before", "商品前分隔线"),
     ("products", "菜序 / 厨房商品明细"),
     ("separator_after", "商品后分隔线"),
-    ("location", "门店 / 厨房名称"),
-    ("time", "下单时间"),
+    ("location", "门店名称 / 下单时间（左右排列）"),
 )
 BLOCK_IDS = {key for key, _ in BLOCKS}
-CONTENT_OVERRIDE_BLOCKS = {"order_type", "status", "order_meta", "location", "time"}
+CONTENT_OVERRIDE_BLOCKS = {"tracking", "order_type", "status", "order_meta", "location"}
 ALIGNS = {"inherit", "left", "center", "right"}
 CUSTOM_KINDS = {"text", "separator", "spacer"}
 CUSTOM_ID = re.compile(r"^custom_[a-z0-9_-]{4,64}$")
@@ -78,6 +78,10 @@ def validate_kitchen_template(payload: Any) -> dict[str, Any]:
             raise ValueError("每个厨房单区块必须是对象")
         block_id = str(raw.get("id") or "").strip()
         kind = str(raw.get("kind") or ("builtin" if block_id in BLOCK_IDS else ""))
+        # Templates saved before the combined footer used a separate time block.
+        # Its data is now rendered on the right side of the location row.
+        if block_id == "time" and kind == "builtin":
+            continue
         is_builtin = kind == "builtin" and block_id in BLOCK_IDS
         is_custom = kind in CUSTOM_KINDS and bool(CUSTOM_ID.fullmatch(block_id))
         if (not is_builtin and not is_custom) or block_id in seen:

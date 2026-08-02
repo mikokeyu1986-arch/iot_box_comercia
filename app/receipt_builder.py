@@ -41,6 +41,11 @@ _LABELS: dict[str, dict[str, str]] = {
         "CHANGE": "Cambio",
         "CODE": "Código",
         "NOTE": "Nota",
+        "LOYALTY_WON": "Ganados",
+        "LOYALTY_SPENT": "Utilizados",
+        "LOYALTY_BALANCE": "Saldo",
+        "POINTS": "Puntos",
+        "UNTIL": "Hasta",
         "QTY": "Uds.",
         "PRODUCT": "Producto",
         "AMOUNT": "Importe",
@@ -57,6 +62,11 @@ _LABELS: dict[str, dict[str, str]] = {
         "CHANGE": "Change",
         "CODE": "Code",
         "NOTE": "Note",
+        "LOYALTY_WON": "Won",
+        "LOYALTY_SPENT": "Spent",
+        "LOYALTY_BALANCE": "Balance",
+        "POINTS": "Points",
+        "UNTIL": "Until",
         "QTY": "Qty",
         "PRODUCT": "Product",
         "AMOUNT": "Amount",
@@ -73,6 +83,11 @@ _LABELS: dict[str, dict[str, str]] = {
         "CHANGE": "找零",
         "CODE": "编码",
         "NOTE": "备注",
+        "LOYALTY_WON": "本次获得",
+        "LOYALTY_SPENT": "本次使用",
+        "LOYALTY_BALANCE": "积分余额",
+        "POINTS": "积分",
+        "UNTIL": "有效期至",
         "QTY": "数量",
         "PRODUCT": "商品",
         "AMOUNT": "金额",
@@ -376,19 +391,41 @@ def _company_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _customer_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
-    partner = order.get("partner_id")
+    partner = order.get("partner_id") or order.get("partner") or order.get("customer")
     if not isinstance(partner, dict):
         return []
     lines: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def add(value: Any, *, bold: bool = False, value_class: str = "") -> None:
+        text = _text(value)
+        identity = text.casefold()
+        if not text or identity in seen:
+            return
+        seen.add(identity)
+        classes = ["customer-info"]
+        if value_class:
+            classes.append(value_class)
+        lines.append({"text": text, "align": "center", "bold": bold, "classes": classes})
+
     full_name = ", ".join(filter(None, [_text(partner.get("parent_name")), _text(partner.get("name"))]))
     if full_name:
-        lines.append({"text": full_name, "align": "center"})
-    address = _text(partner.get("pos_contact_address") or partner.get("street"))
-    if address:
-        lines.append({"text": address, "align": "center"})
-    vat = _text(partner.get("vat"))
-    if vat:
-        lines.append({"text": vat, "align": "center"})
+        add(full_name, bold=True, value_class="customer-name")
+    add(partner.get("vat") or partner.get("tax_id"), value_class="customer-vat")
+    contact_address = _text(partner.get("pos_contact_address") or partner.get("contact_address"))
+    if contact_address:
+        add(contact_address, value_class="customer-address")
+    else:
+        add(partner.get("street") or partner.get("address"), value_class="customer-address")
+        add(partner.get("street2"), value_class="customer-address")
+        locality = " ".join(filter(None, [
+            _text(partner.get("zip")), _text(partner.get("city")), _text(partner.get("state_id")),
+        ]))
+        add(locality, value_class="customer-region")
+        add(partner.get("country_id"), value_class="customer-country")
+    add(partner.get("phone"), value_class="customer-phone")
+    add(partner.get("mobile"), value_class="customer-mobile")
+    add(partner.get("email"), value_class="customer-email")
     return lines
 
 
@@ -422,6 +459,385 @@ def _ticket_qr_src(order: dict[str, Any]) -> str:
     return f"{base_url}/report/barcode?{urlencode({'barcode_type': 'QR', 'value': validation_url, 'width': 180, 'height': 180})}"
 
 
+def _program_type(item: dict[str, Any]) -> str:
+    program = item.get("program") or item.get("program_id")
+    if isinstance(program, dict):
+        value = program.get("program_type") or program.get("type")
+    else:
+        value = None
+    return _text(item.get("program_type") or value).lower()
+
+
+def _collect_records(order: dict[str, Any], field_names: tuple[str, ...]) -> list[dict[str, Any]]:
+    result: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for field_name in field_names:
+        raw_cards = order.get(field_name)
+        if isinstance(raw_cards, dict):
+            raw_cards = [raw_cards]
+        if not isinstance(raw_cards, list):
+            continue
+        for raw_card in raw_cards:
+            if not isinstance(raw_card, dict):
+                continue
+            code = _text(
+                raw_card.get("code") or raw_card.get("barcode")
+                or raw_card.get("coupon_code") or raw_card.get("voucher_code")
+            )
+            identity = code or _text(raw_card.get("id") or raw_card.get("name") or raw_card.get("title"))
+            identity = identity.casefold()
+            if identity and identity in seen:
+                continue
+            if identity:
+                seen.add(identity)
+            result.append(raw_card)
+    return result
+
+
+def _voucher_cards(order: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect gift cards and eWallets, excluding coupon/loyalty programs."""
+    cards = _collect_records(order, (
+        "loyalty_cards", "loyaltyCards", "gift_cards", "giftCards",
+        "vouchers", "wallets", "e_wallets", "eWallets",
+    ))
+    return [
+        card for card in cards
+        if not _program_type(card) or _program_type(card) in {"gift_card", "ewallet"}
+    ]
+
+
+def _coupon_cards(order: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect Odoo coupon codes generated or activated for the order."""
+    cards = _collect_records(order, (
+        "new_coupon_info", "newCouponInfo", "coupons", "coupon_codes",
+        "activated_coupons", "activatedCoupons",
+    ))
+    return [
+        card for card in cards
+        if not _program_type(card)
+        or _program_type(card) in {"coupons", "promo_code", "next_order_coupons"}
+    ]
+
+
+def _promotion_records(order: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect explicit promotions and Odoo POS reward order lines."""
+    records = _collect_records(order, (
+        "promotions", "applied_promotions", "appliedPromotions",
+        "rewards", "claimed_rewards", "claimedRewards",
+    ))
+    for line in order.get("lines") or order.get("orderlines") or []:
+        if not isinstance(line, dict) or not line.get("is_reward_line"):
+            continue
+        reward = line.get("reward_id") or line.get("reward")
+        reward = reward if isinstance(reward, dict) else {}
+        record = {
+            "name": reward.get("description") or reward.get("name")
+                    or line.get("full_product_name") or line.get("product_name"),
+            "program": reward.get("program_id") or line.get("program_id"),
+            "reward_type": reward.get("reward_type") or line.get("reward_type"),
+            "amount": line.get("price_subtotal_incl") or line.get("price") or line.get("total"),
+            "points_cost": line.get("points_cost"),
+            "code": line.get("reward_identifier_code"),
+        }
+        if not _program_type(record) or _program_type(record) in {"promotion", "buy_x_get_y"}:
+            records.append(record)
+    return [
+        record for record in records
+        if not _program_type(record) or _program_type(record) in {"promotion", "buy_x_get_y"}
+    ]
+
+
+def _voucher_amount(order: dict[str, Any], card: dict[str, Any]) -> str:
+    for field_name in (
+        "balance", "remaining_balance", "current_balance", "available_balance",
+        "remaining_amount", "balance_amount", "amount", "point",
+    ):
+        raw_value = card.get(field_name)
+        if raw_value in (None, ""):
+            continue
+        parsed = _parse_decimal(raw_value)
+        return _money(order, parsed) if parsed is not None else _text(raw_value)
+    return ""
+
+
+def build_voucher_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
+    lines: list[dict[str, Any]] = []
+    labels = _labels(_resolve_lang(order))
+    for card in _voucher_cards(order):
+        lines.append({
+            "type": "spacer", "align": "left",
+            "classes": ["receipt-spacer", "gift-card-spacer"],
+        })
+        name = _text(
+            card.get("name") or card.get("title") or card.get("program_name")
+            or "Tarjeta regalo"
+        )
+        code = _text(
+            card.get("code") or card.get("barcode")
+            or card.get("coupon_code") or card.get("voucher_code")
+        )
+        if name:
+            lines.append({
+                "text": name, "align": "center", "bold": True,
+                "classes": ["gift-card-title"],
+            })
+        if code:
+            lines.append({
+                "text": code, "align": "center",
+                "classes": ["gift-card-code"],
+            })
+        explicit_barcode = _text(card.get("barcodeSrc") or card.get("barcode_src") or card.get("barcode_url"))
+        qr_src = _text(card.get("qrSrc") or card.get("qr_src") or card.get("qr_url"))
+        if code or explicit_barcode:
+            barcode_src = explicit_barcode or f"/report/barcode?{urlencode({'barcode_type': 'Code128', 'value': code, 'width': 360, 'height': 80})}"
+            lines.append({
+                "type": "image", "src": barcode_src, "align": "center",
+                "classes": ["gift-card-barcode"], "width": 360, "height": 80,
+                "image_kind": "barcode", "barcode_type": "Code128",
+                "barcode_value": code,
+            })
+        elif qr_src:
+            lines.append({
+                "type": "image", "src": qr_src, "align": "center",
+                "classes": ["gift-card-qr"], "width": 125, "height": 125,
+                "image_kind": "qr",
+            })
+        expiration = _text(card.get("expiration_date") or card.get("expirationDate"))
+        if expiration:
+            lines.append({
+                "text": f"{labels['UNTIL']}: {expiration}", "align": "center",
+                "classes": ["gift-card-expiration"],
+            })
+        amount = _voucher_amount(order, card)
+        if amount:
+            lines.append({
+                "text": amount, "align": "center", "bold": True,
+                "double_width": True, "classes": ["gift-card-amount"],
+            })
+    return lines
+
+
+def build_coupon_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
+    """Render Odoo coupon codes separately from gift-card balances."""
+    lines: list[dict[str, Any]] = []
+    labels = _labels(_resolve_lang(order))
+    for coupon in _coupon_cards(order):
+        name = _text(coupon.get("program_name") or coupon.get("name") or coupon.get("title") or "Cupón")
+        code = _text(coupon.get("code") or coupon.get("barcode") or coupon.get("coupon_code"))
+        lines.append({"type": "spacer", "classes": ["receipt-spacer", "coupon-spacer"]})
+        lines.append({"text": name, "align": "center", "bold": True, "classes": ["coupon-title"]})
+        if code:
+            lines.append({"text": code, "align": "center", "classes": ["coupon-code"]})
+            lines.append({
+                "type": "image", "src": f"/report/barcode?{urlencode({'barcode_type': 'Code128', 'value': code, 'width': 360, 'height': 80})}",
+                "align": "center", "classes": ["coupon-barcode"], "width": 360, "height": 80,
+                "image_kind": "barcode", "barcode_type": "Code128", "barcode_value": code,
+            })
+        expiration = _text(coupon.get("expiration_date") or coupon.get("expirationDate"))
+        if expiration:
+            lines.append({"text": f"{labels['UNTIL']}: {expiration}", "align": "center", "classes": ["coupon-expiration"]})
+    return lines
+
+
+def build_promotion_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
+    """Render applied promotion/reward metadata without hiding reward product lines."""
+    lines: list[dict[str, Any]] = []
+    for promotion in _promotion_records(order):
+        program = promotion.get("program") or promotion.get("program_id")
+        program_name = _text(program.get("name")) if isinstance(program, dict) else ""
+        name = _text(promotion.get("name") or promotion.get("description") or program_name or "Promoción")
+        reward_type = _text(promotion.get("reward_type") or promotion.get("type"))
+        amount = promotion.get("amount") or promotion.get("discount_amount")
+        points_cost = promotion.get("points_cost")
+        code = _text(promotion.get("code") or promotion.get("reward_identifier_code"))
+        detail_parts = []
+        if reward_type:
+            detail_parts.append(reward_type.replace("_", " "))
+        parsed_amount = _parse_decimal(amount)
+        if parsed_amount not in (None, Decimal("0")):
+            detail_parts.append(_money(order, parsed_amount))
+        if _parse_decimal(points_cost) not in (None, Decimal("0")):
+            detail_parts.append(f"{_points_text(points_cost)} pts")
+        lines.append({"text": name, "align": "left", "bold": True, "classes": ["promotion-title"]})
+        if program_name and program_name.casefold() != name.casefold():
+            lines.append({"text": program_name, "align": "left", "classes": ["promotion-program"]})
+        if detail_parts:
+            lines.append({"text": " · ".join(detail_parts), "align": "left", "classes": ["promotion-detail"]})
+        if code:
+            lines.append({"text": code, "align": "left", "classes": ["promotion-code"]})
+    return lines
+
+
+def _payment_terminal_receipts(order: dict[str, Any]) -> list[dict[str, Any]]:
+    """Collect Redsys/payment-terminal receipts from Odoo's common payload shapes."""
+    receipts = _collect_records(order, (
+        "payment_terminal_receipts", "paymentTerminalReceipts",
+        "redsys_receipts", "redsysReceipts", "card_receipts", "cardReceipts",
+    ))
+    for payment in order.get("payment_lines") or order.get("statement_ids") or []:
+        if not isinstance(payment, dict):
+            continue
+        receipt_value = (
+            payment.get("payment_terminal_receipt") or payment.get("paymentTerminalReceipt")
+            or payment.get("terminal_receipt") or payment.get("receipt") or payment.get("ticket")
+        )
+        terminal_fields = {
+            "authorization_code", "auth_code", "transaction_id", "terminal_id",
+            "card_type", "card_number", "cardholder_name", "merchant_id", "stan", "rrn",
+        }
+        if receipt_value or terminal_fields.intersection(payment):
+            entry = dict(payment)
+            if receipt_value and not entry.get("receipt"):
+                entry["receipt"] = receipt_value
+            receipts.append(entry)
+    return receipts
+
+
+def build_payment_terminal_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
+    """Render Redsys card transaction records while preserving native receipt text."""
+    lines: list[dict[str, Any]] = []
+    field_labels = (
+        (("card_type", "card_brand"), "Tarjeta"),
+        (("card_number", "masked_card", "pan"), "Tarjeta nº"),
+        (("cardholder_name",), "Titular"),
+        (("authorization_code", "auth_code"), "Autorización"),
+        (("terminal_id", "terminal"), "Terminal"),
+        (("transaction_id", "transaction", "operation_id"), "Transacción"),
+        (("merchant_id", "merchant"), "Comercio"),
+        (("stan",), "STAN"),
+        (("rrn",), "RRN"),
+    )
+    for receipt in _payment_terminal_receipts(order):
+        receipt_lines: list[str] = []
+        raw_lines = receipt.get("lines")
+        if isinstance(raw_lines, list):
+            receipt_lines.extend(_text(value) for value in raw_lines if _text(value))
+        for field_name in (
+            "receipt", "payment_terminal_receipt", "paymentTerminalReceipt",
+            "terminal_receipt", "ticket", "text",
+        ):
+            raw_text = receipt.get(field_name)
+            if isinstance(raw_text, str) and raw_text.strip():
+                receipt_lines.extend(line.strip() for line in raw_text.splitlines() if line.strip())
+        if not receipt_lines:
+            for aliases, label in field_labels:
+                value = next((_text(receipt.get(alias)) for alias in aliases if _text(receipt.get(alias))), "")
+                if value:
+                    receipt_lines.append(f"{label}: {value}")
+        if not receipt_lines:
+            continue
+        lines.append({
+            "type": "spacer", "align": "left",
+            "classes": ["receipt-spacer", "payment-terminal-spacer", "redsys-spacer"],
+        })
+        logo = receipt.get("logo") if isinstance(receipt.get("logo"), dict) else {}
+        nfc_src = _text(
+            receipt.get("nfc_logo_src") or receipt.get("nfcLogoSrc")
+            or receipt.get("contactless_logo_src") or receipt.get("contactlessLogoSrc")
+            or logo.get("src")
+        )
+        is_contactless = bool(
+            receipt.get("contactless") or receipt.get("is_contactless") or receipt.get("nfc")
+            or any("CONTACTLESS" in text.upper() or "NFC" in text.upper() for text in receipt_lines)
+        )
+        if nfc_src or is_contactless:
+            lines.append({
+                "type": "image", "src": nfc_src or "/assets/nfc_override.png", "align": "center",
+                "classes": ["payment-terminal-logo", "payment-terminal-nfc-icon", "redsys-nfc-logo"],
+                "width": 80, "image_kind": "logo",
+            })
+        for text in receipt_lines:
+            lines.append({
+                "text": text, "align": "center",
+                "classes": ["payment-terminal-line", "pos-payment-terminal-receipt", "redsys-receipt-line"],
+            })
+    return lines
+
+
+def _loyalty_stats(order: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return Odoo getLoyaltyPoints()-shaped rows plus common serialized aliases."""
+    for field_name in ("loyalty_points", "loyaltyPoints", "loyalty_stats", "loyaltyStats"):
+        raw_stats = order.get(field_name)
+        if isinstance(raw_stats, dict):
+            raw_stats = list(raw_stats.values())
+        if isinstance(raw_stats, list):
+            return [
+                item for item in raw_stats
+                if isinstance(item, dict)
+                and (not _program_type(item) or _program_type(item) == "loyalty")
+            ]
+
+    ui_state = order.get("uiState") if isinstance(order.get("uiState"), dict) else {}
+    changes = order.get("couponPointChanges") or ui_state.get("couponPointChanges")
+    if isinstance(changes, dict):
+        changes = list(changes.values())
+    if not isinstance(changes, list):
+        return []
+    result = []
+    for change in changes:
+        if not isinstance(change, dict):
+            continue
+        if _program_type(change) and _program_type(change) != "loyalty":
+            continue
+        result.append({
+            "couponId": change.get("coupon_id"),
+            "points": {
+                "name": change.get("point_name") or change.get("name") or "Points",
+                "won": change.get("points") or 0,
+                "spent": change.get("spent") or 0,
+                "balance": change.get("balance") or 0,
+                "total": change.get("total") or 0,
+            },
+        })
+    return result
+
+
+def _points_text(value: Any) -> str:
+    parsed = _parse_decimal(value)
+    if parsed is None:
+        return _text(value)
+    if parsed == parsed.to_integral_value():
+        return str(int(parsed))
+    return f"{parsed:.2f}".rstrip("0").rstrip(".").replace(".", ",")
+
+
+def build_loyalty_lines(order: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build Odoo-native loyalty won/spent/balance rows without currency symbols."""
+    labels = _labels(_resolve_lang(order))
+    lines: list[dict[str, Any]] = []
+    for stat in _loyalty_stats(order):
+        program = stat.get("program") if isinstance(stat.get("program"), dict) else {}
+        if program and program.get("portal_visible") is False:
+            continue
+        points = stat.get("points") if isinstance(stat.get("points"), dict) else stat
+        name = _text(points.get("name") or stat.get("name") or labels["POINTS"])
+        won = points.get("won")
+        spent = points.get("spent")
+        balance = points.get("balance")
+        total = points.get("total")
+        if not any(_parse_decimal(value) not in (None, Decimal("0")) for value in (won, spent, balance, total)):
+            continue
+        lines.append({
+            "type": "spacer", "align": "left",
+            "classes": ["receipt-spacer", "loyalty-spacer"],
+        })
+        for label, value, value_class in (
+            (f"{name} {labels['LOYALTY_WON']}", won, "loyalty-won"),
+            (f"{name} {labels['LOYALTY_SPENT']}", spent, "loyalty-spent"),
+            (f"{labels['LOYALTY_BALANCE']} {name}", balance if balance not in (None, "") else total, "loyalty-balance"),
+        ):
+            parsed = _parse_decimal(value)
+            if parsed is None or parsed == 0:
+                continue
+            lines.append({
+                "type": "header_meta_line",
+                "left_text": label,
+                "right_text": _points_text(value),
+                "classes": ["loyalty-points", value_class],
+            })
+    return lines
+
+
 # ── kitchen ticket builder ────────────────────────────────────────────
 
 def build_kitchen_ticket_lines(
@@ -433,13 +849,11 @@ def build_kitchen_ticket_lines(
 
     Matches the auto-print style from _buildKitchenEscposLines() in the
     Odoo preparation display service:
-      1. "NUEVO" title (double width/height, centered, bold)
-      2. Tracking number + table ref (header_meta_line)
-      3. Separator
-      4. Product lines (qty + name + attributes + notes)
-      5. Separator
-      6. Config/shop name (centered)
-      7. Time (centered)
+      1. Tracking number at the very top
+      2. Order type and "NUEVO" title
+      3. Raw table number without a MESA/TABLE prefix
+      4. Product lines and separators
+      5. Config name (left) + order time (right)
     """
     lines: list[dict[str, Any]] = []
     lang = _resolve_lang(order)
@@ -449,7 +863,19 @@ def build_kitchen_ticket_lines(
         for template_line in lines[start:]:
             template_line["_template_block"] = block_id
 
-    # ── 1. Order type line ──
+    # ── 1. Tracking number at the very top, independent from table ──
+    block_start = len(lines)
+    tracking = _text(order.get("tracking_number"))
+    if tracking:
+        lines.append({
+            "text": f"# {tracking}",
+            "align": "center", "bold": True,
+            "double_width": True, "double_height": True,
+            "classes": ["kitchen-tracking-number"],
+        })
+    mark_block(block_start, "tracking")
+
+    # ── 2. Order type line ──
     block_start = len(lines)
     service_type = order.get("service_type") if isinstance(order.get("service_type"), dict) else {}
     chino_order_type = _text(order.get("chino_order_type"))
@@ -464,7 +890,7 @@ def build_kitchen_ticket_lines(
     })
     mark_block(block_start, "order_type")
 
-    # ── 2. Native kitchen notification: NUEVO, CANCELA, CAMBIO, etc. ──
+    # ── 3. Native kitchen notification: NUEVO, CANCELA, CAMBIO, etc. ──
     block_start = len(lines)
     changes = order.get("changes") if isinstance(order.get("changes"), dict) else {}
     kitchen_title = _text(
@@ -477,20 +903,15 @@ def build_kitchen_ticket_lines(
     })
     mark_block(block_start, "status")
 
-    # ── 3. Tracking number + table ref (header_meta_line like auto-print) ──
+    # ── 4. Table number value only (no MESA/TABLE prompt) ──
     block_start = len(lines)
-    tracking = _text(order.get("tracking_number"))
     table = _table_text(order)
-    left = f"# {tracking}" if tracking else ""
-    right = f"{L['TABLE']} {table}" if table else ""
-    if left or right:
+    if table:
         lines.append({
-            "type": "header_meta_line",
-            "left_text": left,
-            "right_text": right,
-            "bold": True,
-            "double_width": True,
-            "double_height": True,
+            "text": table,
+            "align": "center", "bold": True,
+            "double_width": True, "double_height": True,
+            "classes": ["kitchen-table-number"],
         })
     mark_block(block_start, "order_meta")
 
@@ -603,31 +1024,35 @@ def build_kitchen_ticket_lines(
     lines.append({"text": SEPARATOR, "align": "left"})
     mark_block(block_start, "separator_after")
 
-    # ── 5. Config name (shop/restaurant name, centered) ──
+    # ── 5. Config name (left) + order time (right) ──
     block_start = len(lines)
     config = order.get("config", {}) if isinstance(order.get("config"), dict) else {}
     config_name = _text(config.get("name") or order.get("pos_reference") or "")
     if not config_name:
         company = order.get("company", {}) if isinstance(order.get("company"), dict) else {}
         config_name = _text(company.get("name"))
-    if config_name:
-        lines.append({"text": config_name, "align": "center"})
-    mark_block(block_start, "location")
-
-    # ── 6. Time (centered) ──
-    block_start = len(lines)
     date_text = _order_date_text(order)
     time_part = date_text[11:16] if len(date_text) >= 16 else date_text
-    if time_part:
-        lines.append({"text": time_part, "align": "center"})
-    mark_block(block_start, "time")
+    if config_name or time_part:
+        lines.append({
+            "type": "header_meta_line",
+            "left_text": config_name,
+            "right_text": time_part,
+            "classes": ["kitchen-footer", "kitchen-location-time"],
+        })
+    mark_block(block_start, "location")
 
     _logger.info(
-        "Built kitchen ticket lines=%s table=%s tracking=%s",
-        len(lines), table or "<none>", tracking or "<none>",
+        "Built kitchen ticket lines=%s tracking=%s",
+        len(lines), tracking or "<none>",
     )
     if preview_fields:
         placeholders: dict[str, list[dict[str, Any]]] = {
+            "tracking": [{
+                "text": "# {{ tracking_number }}", "align": "center", "bold": True,
+                "double_width": True, "double_height": True,
+                "classes": ["kitchen-tracking-number"],
+            }],
             "order_type": [{
                 "text": "{{ chino_order_type || 'DINE IN' }}", "align": "center", "bold": True,
                 "double_width": True, "double_height": True,
@@ -638,9 +1063,9 @@ def build_kitchen_ticket_lines(
                 "double_width": True, "double_height": True,
             }],
             "order_meta": [{
-                "type": "header_meta_line", "left_text": "# {{ tracking_number }}",
-                "right_text": "MESA {{ table_id.table_number }}", "bold": True,
+                "text": "{{ table_id.table_number }}", "align": "center", "bold": True,
                 "double_width": True, "double_height": True,
+                "classes": ["kitchen-table-number"],
             }],
             "separator_before": [{"text": SEPARATOR, "align": "left"}],
             "products": [
@@ -659,8 +1084,12 @@ def build_kitchen_ticket_lines(
                 {"text": "NOTA: {{ course_groups[].items[].customer_note }}", "align": "left", "bold": True},
             ],
             "separator_after": [{"text": SEPARATOR, "align": "left"}],
-            "location": [{"text": "{{ config.name }}", "align": "center"}],
-            "time": [{"text": "{{ date_order.time }}", "align": "center"}],
+            "location": [{
+                "type": "header_meta_line",
+                "left_text": "{{ config.name }}",
+                "right_text": "{{ date_order.time }}",
+                "classes": ["kitchen-footer", "kitchen-location-time"],
+            }],
         }
         seen: set[str] = set()
         preview_lines: list[dict[str, Any]] = []
@@ -868,6 +1297,11 @@ def build_receipt_lines(
             })
     mark_block(block_start, "products")
 
+    # Applied promotions and reward metadata are independently configurable.
+    block_start = len(lines)
+    lines.extend(build_promotion_lines(order))
+    mark_block(block_start, "promotions")
+
     # ══════════════════════════════════════════════════════════════════
     # 9. Spacer (replaces separator before Discount/Tax)
     # ══════════════════════════════════════════════════════════════════
@@ -910,9 +1344,8 @@ def build_receipt_lines(
         })
 
     # ══════════════════════════════════════════════════════════════════
-    # 13. Separator + TOTAL
+    # 13. TOTAL (separators are controlled by custom template blocks)
     # ══════════════════════════════════════════════════════════════════
-    lines.append({"text": SEPARATOR, "align": "left"})
     total_due = order.get("totalDue")
     if total_due is not None:
         lines.append({
@@ -920,7 +1353,6 @@ def build_receipt_lines(
             "align": "center", "bold": True,
             "double_width": True, "double_height": True,
         })
-    lines.append({"text": SEPARATOR, "align": "left"})
     mark_block(block_start, "totals")
 
     # ══════════════════════════════════════════════════════════════════
@@ -966,7 +1398,35 @@ def build_receipt_lines(
     mark_block(block_start, "payments")
 
     # ══════════════════════════════════════════════════════════════════
-    # 15. QR + Portal URL
+    # Redsys / payment-terminal card transaction receipt
+    # ══════════════════════════════════════════════════════════════════
+    block_start = len(lines)
+    lines.extend(build_payment_terminal_lines(order))
+    mark_block(block_start, "redsys")
+
+    # ══════════════════════════════════════════════════════════════════
+    # 15. Coupons generated or activated by Odoo loyalty programs
+    # ══════════════════════════════════════════════════════════════════
+    block_start = len(lines)
+    lines.extend(build_coupon_lines(order))
+    mark_block(block_start, "coupons")
+
+    # ══════════════════════════════════════════════════════════════════
+    # 16. Gift cards and eWallet balances
+    # ══════════════════════════════════════════════════════════════════
+    block_start = len(lines)
+    lines.extend(build_voucher_lines(order))
+    mark_block(block_start, "vouchers")
+
+    # ══════════════════════════════════════════════════════════════════
+    # 17. Loyalty membership points (never currency)
+    # ══════════════════════════════════════════════════════════════════
+    block_start = len(lines)
+    lines.extend(build_loyalty_lines(order))
+    mark_block(block_start, "loyalty")
+
+    # ══════════════════════════════════════════════════════════════════
+    # 17. QR + Portal URL
     # ══════════════════════════════════════════════════════════════════
     invoice_qr_lines = []
     if is_final:
@@ -1087,9 +1547,22 @@ def _replace_with_field_placeholders(lines: list[dict[str, Any]]) -> list[dict[s
             {"text": "{{ company.phone }}", "align": "center"},
         ],
         "customer": [
-            {"text": "{{ partner_id.name }}", "align": "center"},
-            {"text": "{{ partner_id.pos_contact_address }}", "align": "center"},
-            {"text": "{{ partner_id.vat }}", "align": "center"},
+            {"text": "{{ partner_id.parent_name }} / {{ partner_id.name }}", "align": "center", "bold": True,
+             "classes": ["customer-info", "customer-name"]},
+            {"text": "{{ partner_id.vat }}", "align": "center",
+             "classes": ["customer-info", "customer-vat"]},
+            {"text": "{{ partner_id.pos_contact_address }}", "align": "center",
+             "classes": ["customer-info", "customer-address"]},
+            {"text": "{{ partner_id.street }} / {{ partner_id.street2 }}", "align": "center",
+             "classes": ["customer-info", "customer-address-fields"]},
+            {"text": "{{ partner_id.zip }} {{ partner_id.city }} {{ partner_id.state_id.name }}", "align": "center",
+             "classes": ["customer-info", "customer-region"]},
+            {"text": "{{ partner_id.country_id.name }}", "align": "center",
+             "classes": ["customer-info", "customer-country"]},
+            {"text": "{{ partner_id.phone }} / {{ partner_id.mobile }}", "align": "center",
+             "classes": ["customer-info", "customer-phone"]},
+            {"text": "{{ partner_id.email }}", "align": "center",
+             "classes": ["customer-info", "customer-email"]},
         ],
         "table": [{
             "text": "MESA {{ table_id.table_number }}", "align": "center", "bold": True,
@@ -1124,19 +1597,84 @@ def _replace_with_field_placeholders(lines: list[dict[str, Any]]) -> list[dict[s
             "original_total": "price_without_discount",
             "combo_items": ["orderDisplayProductName.attributeString"],
         }],
+        "promotions": [
+            {"text": "{{ lines[].reward_id.name }}", "align": "left", "bold": True,
+             "classes": ["promotion-title"]},
+            {"text": "{{ lines[].reward_id.program_id.name }}", "align": "left",
+             "classes": ["promotion-program"]},
+            {"text": "{{ lines[].reward_id.reward_type }} · {{ lines[].points_cost }} pts",
+             "align": "left", "classes": ["promotion-detail"]},
+            {"text": "{{ lines[].reward_identifier_code }}", "align": "left",
+             "classes": ["promotion-code"]},
+        ],
         "totals": [
             {"type": "header_meta_line", "left_text": "Subtotal", "right_text": "{{ subtotal }}"},
             {"type": "header_meta_line", "left_text": "Descuento", "right_text": "{{ discount_total }}"},
             {"type": "header_meta_line", "left_text": "{{ tax_names[] }}", "right_text": "{{ amountTaxes }}"},
-            {"text": SEPARATOR, "align": "left"},
             {"text": "TOTAL {{ totalDue }}", "align": "center", "bold": True,
              "double_width": True, "double_height": True},
-            {"text": SEPARATOR, "align": "left"},
         ],
         "payments": [
             {"type": "header_meta_line", "left_text": "{{ payment_lines[].name }}",
              "right_text": "{{ payment_lines[].amount }}"},
             {"type": "header_meta_line", "left_text": "Cambio", "right_text": "{{ change }}"},
+        ],
+        "redsys": [
+            {"type": "image", "src": "/assets/nfc_override.png", "align": "center", "width": 80,
+             "image_kind": "logo",
+             "classes": ["payment-terminal-logo", "payment-terminal-nfc-icon", "redsys-nfc-logo"]},
+            {"text": "{{ payment_terminal_receipts[].lines[] }}", "align": "center",
+             "classes": ["payment-terminal-line", "pos-payment-terminal-receipt", "redsys-receipt-line"]},
+            {"text": "{{ payment_lines[].payment_terminal_receipt }}", "align": "center",
+             "classes": ["payment-terminal-line", "pos-payment-terminal-receipt", "redsys-receipt-line"]},
+            {"text": "{{ payment_lines[].card_type }} / {{ payment_lines[].card_number }}", "align": "center",
+             "classes": ["redsys-card-field"]},
+            {"text": "{{ payment_lines[].authorization_code }} / {{ payment_lines[].transaction_id }}", "align": "center",
+             "classes": ["redsys-transaction-field"]},
+            {"text": "{{ payment_lines[].terminal_id }} / {{ payment_lines[].merchant_id }}", "align": "center",
+             "classes": ["redsys-terminal-field"]},
+        ],
+        "coupons": [
+            {"type": "spacer", "align": "left", "classes": ["coupon-spacer"]},
+            {"text": "{{ new_coupon_info[].program_name }}", "align": "center", "bold": True,
+             "classes": ["coupon-title"]},
+            {"text": "{{ new_coupon_info[].code }}", "align": "center",
+             "classes": ["coupon-code"]},
+            {"type": "image", "src": "{{ new_coupon_info[].code | barcode('Code128') }}",
+             "barcode_value": "{{ new_coupon_info[].code }}", "align": "center",
+             "image_kind": "barcode", "classes": ["coupon-barcode"]},
+            {"text": "{{ new_coupon_info[].expiration_date }}", "align": "center",
+             "classes": ["coupon-expiration"]},
+            {"text": "{{ coupons[].program_type }}", "align": "center",
+             "classes": ["coupon-program-type-field"]},
+        ],
+        "vouchers": [
+            {"type": "spacer", "align": "left", "classes": ["gift-card-spacer"]},
+            {"text": "{{ loyalty_cards[].name }}", "align": "center", "bold": True,
+             "classes": ["gift-card-title"]},
+            {"text": "{{ loyalty_cards[].code }}", "align": "center",
+             "classes": ["gift-card-code"]},
+            {"type": "image", "src": "{{ loyalty_cards[].code | barcode('Code128') }}",
+             "barcode_value": "{{ loyalty_cards[].code }}", "align": "center",
+             "image_kind": "barcode", "classes": ["gift-card-barcode"]},
+            {"text": "{{ loyalty_cards[].balance }}", "align": "center", "bold": True,
+             "double_width": True, "classes": ["gift-card-amount"]},
+            {"text": "{{ loyalty_cards[].point }}", "align": "center",
+             "classes": ["gift-card-point-field"]},
+            {"text": "{{ loyalty_cards[].qrSrc }}", "align": "center",
+             "classes": ["gift-card-qr-field"]},
+            {"text": "{{ loyalty_cards[].program_type }}", "align": "center",
+             "classes": ["gift-card-program-type-field"]},
+        ],
+        "loyalty": [
+            {"type": "header_meta_line", "left_text": "{{ loyalty_points[].points.name }} Ganados",
+             "right_text": "{{ loyalty_points[].points.won }}", "classes": ["loyalty-points", "loyalty-won"]},
+            {"type": "header_meta_line", "left_text": "{{ loyalty_points[].points.name }} Utilizados",
+             "right_text": "{{ loyalty_points[].points.spent }}", "classes": ["loyalty-points", "loyalty-spent"]},
+            {"type": "header_meta_line", "left_text": "Saldo {{ loyalty_points[].points.name }}",
+             "right_text": "{{ loyalty_points[].points.balance }}", "classes": ["loyalty-points", "loyalty-balance"]},
+            {"text": "{{ loyalty_points[].points.total }}", "align": "right",
+             "classes": ["loyalty-total-field"]},
         ],
         "footer": [{"text": "{{ config.receipt_footer }}", "align": "center"}],
         "delivery": [

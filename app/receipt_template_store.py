@@ -18,14 +18,19 @@ from typing import Any
 BLOCKS = (
     ("logo", "Logo"),
     ("company", "商家信息"),
-    ("customer", "顾客信息"),
+    ("customer", "客户信息 (Información del cliente)"),
     ("table", "桌号 / 取餐号"),
     ("invoice", "简化发票"),
     ("order_info", "订单信息"),
     ("product_header", "商品表头"),
     ("products", "商品明细"),
+    ("promotions", "促销 / 奖励 (Promociones)"),
     ("totals", "金额合计"),
     ("payments", "付款信息"),
+    ("redsys", "Redsys 刷卡记录"),
+    ("coupons", "优惠券 (Cupones)"),
+    ("vouchers", "礼品卡 / 电子钱包 (Tarjeta de regalo / eWallet)"),
+    ("loyalty", "会员积分 (Programa de fidelización)"),
     ("footer", "页脚文字"),
     ("delivery", "外卖信息"),
     ("qr", "二维码 / 票据码"),
@@ -39,7 +44,7 @@ _logger = logging.getLogger(__name__)
 _template_lock = threading.RLock()
 
 
-def default_template() -> dict[str, Any]:
+def _canonical_default_template() -> dict[str, Any]:
     return {
         "version": 1,
         "name": "默认结账小票",
@@ -59,6 +64,16 @@ def default_template() -> dict[str, Any]:
             for key, label in BLOCKS
         ],
     }
+
+
+def default_template() -> dict[str, Any]:
+    """Return the bundled visual default, with a safe canonical fallback."""
+    bundled_path = Path(__file__).resolve().parent.parent / "templates" / "escpos_receipt" / "default_template.json"
+    try:
+        return validate_template(json.loads(bundled_path.read_text(encoding="utf-8")))
+    except Exception:
+        _logger.exception("Invalid bundled receipt default at %s; using canonical layout", bundled_path)
+        return _canonical_default_template()
 
 
 def template_path() -> Path:
