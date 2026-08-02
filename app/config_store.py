@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
+import shutil
 import threading
 from time import monotonic
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 import uuid
+
+
+_logger = logging.getLogger(__name__)
 
 
 class ConfigStore:
@@ -30,7 +35,6 @@ class ConfigStore:
             "scale_timeout": 1.2,
             "scale_inter_command_delay": 0.05,
             "scale_brand": "zfoc",
-            "scale_sse_enabled": False,
         }
 
     def _load(self) -> dict[str, Any]:
@@ -43,10 +47,18 @@ class ConfigStore:
         try:
             data = json.loads(self.config_path.read_text(encoding="utf-8"))
         except Exception:
+            backup = self.config_path.with_suffix(self.config_path.suffix + ".invalid")
+            try:
+                shutil.copy2(self.config_path, backup)
+            except OSError:
+                pass
+            _logger.exception("Invalid runtime configuration at %s; preserved as %s", self.config_path, backup)
             data = {"server_connection": {"connected": False}}
 
         data.setdefault("server_connection", {"connected": False})
         local_config = data.setdefault("local_config", {})
+        for deprecated_key in ("scale_sse_enabled", "redsys_enabled"):
+            local_config.pop(deprecated_key, None)
         for key, value in defaults.items():
             local_config.setdefault(key, value)
         return data
@@ -76,6 +88,12 @@ class ConfigStore:
     def get_connection(self) -> dict[str, Any]:
         with self._lock:
             return dict(self._data.get("server_connection", {}))
+
+    def get_public_connection(self) -> dict[str, Any]:
+        """Return connection status without pairing credentials."""
+        connection = self.get_connection()
+        connection.pop("token", None)
+        return connection
 
     def get_local_config(self) -> dict[str, Any]:
         with self._lock:

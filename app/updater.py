@@ -14,7 +14,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
+import stat
 import tempfile
 import zipfile
 from pathlib import Path
@@ -306,6 +308,8 @@ class UpdateManager:
         """
         if not version_info.download_url:
             raise ValueError("该版本没有可下载的文件")
+        if not re.fullmatch(r"[0-9a-fA-F]{64}", version_info.checksum):
+            raise ValueError("更新清单缺少有效的 SHA-256 校验和，已拒绝不安全更新")
 
         # 确定临时文件路径
         ext = ".zip"
@@ -344,13 +348,11 @@ class UpdateManager:
                         pct = min(100, int(downloaded * 100 / total))
                         progress_callback(pct)
 
-        # 校验
-        if version_info.checksum:
-            _logger.info("校验下载文件...")
-            actual_hash = _sha256_file(tmp_file)
-            if actual_hash.lower() != version_info.checksum.lower():
-                tmp_file.unlink(missing_ok=True)
-                raise ValueError(f"校验和不匹配: 期望 {version_info.checksum}, 实际 {actual_hash}")
+        _logger.info("校验下载文件...")
+        actual_hash = _sha256_file(tmp_file)
+        if actual_hash.lower() != version_info.checksum.lower():
+            tmp_file.unlink(missing_ok=True)
+            raise ValueError(f"校验和不匹配: 期望 {version_info.checksum}, 实际 {actual_hash}")
 
         _logger.info("下载完成: %s (%d bytes)", tmp_file, downloaded)
         return tmp_file
@@ -368,6 +370,7 @@ class UpdateManager:
         3. 覆盖文件
         4. 清理临时文件
         """
+        extract_dir: Path | None = None
         try:
             # 1. 备份
             backup_path = self._create_backup()
@@ -381,7 +384,6 @@ class UpdateManager:
             self._apply_files(effective_dir)
 
             # 4. 清理
-            shutil.rmtree(extract_dir, ignore_errors=True)
             package_path.unlink(missing_ok=True)
 
             # 写入版本标记
@@ -404,6 +406,9 @@ class UpdateManager:
                 current_version=self.current_version,
                 latest_version=version,
             )
+        finally:
+            if extract_dir is not None:
+                shutil.rmtree(extract_dir, ignore_errors=True)
 
     # ------------------------------------------------------------------
     # 辅助方法
@@ -441,17 +446,16 @@ class UpdateManager:
         }
         exclude_suffixes = {".pyc", ".pyo", ".log", ".tmp"}
         result: list[Path] = []
-        for item in self.base_dir.rglob("*"):
-            if item.is_dir():
-                if item.name in exclude_names:
+        for root, directory_names, file_names in os.walk(self.base_dir):
+            directory_names[:] = [
+                name for name in directory_names
+                if name not in exclude_names and not name.startswith(".")
+            ]
+            root_path = Path(root)
+            for name in file_names:
+                item = root_path / name
+                if name in exclude_names or item.suffix in exclude_suffixes:
                     continue
-                if item.name.startswith("."):
-                    continue
-            if item.name in exclude_names:
-                continue
-            if item.suffix in exclude_suffixes:
-                continue
-            if item.is_file():
                 result.append(item)
         return result
 
@@ -460,6 +464,16 @@ class UpdateManager:
         dest.mkdir(parents=True, exist_ok=True)
         if package_path.suffix.lower() == ".zip":
             with zipfile.ZipFile(package_path, "r") as zf:
+                destination = dest.resolve()
+                for member in zf.infolist():
+                    member_path = (dest / member.filename).resolve()
+                    try:
+                        member_path.relative_to(destination)
+                    except ValueError as exc:
+                        raise ValueError(f"更新包包含越界路径: {member.filename}") from exc
+                    file_type = (member.external_attr >> 16) & 0o170000
+                    if file_type == stat.S_IFLNK:
+                        raise ValueError(f"更新包不允许符号链接: {member.filename}")
                 zf.extractall(dest)
         else:
             raise ValueError(f"不支持的文件格式: {package_path.suffix}")
@@ -515,19 +529,24 @@ class UpdateManager:
 
     def rollback(self, backup_name: str) -> UpdateResult:
         """回滚到指定的备份"""
+        if not re.fullmatch(r"backup_[0-9]{8}_[0-9]{6}\.zip", backup_name):
+            return UpdateResult(success=False, message="无效的备份文件名")
         backup_path = self._backup_dir / backup_name
         if not backup_path.exists():
             return UpdateResult(success=False, message=f"备份不存在: {backup_name}")
 
+        extract_dir: Path | None = None
         try:
             # 解压备份到临时目录
             extract_dir = Path(tempfile.mkdtemp(prefix="iot_box_rollback_"))
             effective_dir = self._extract(backup_path, extract_dir)
             self._apply_files(effective_dir)
-            shutil.rmtree(extract_dir, ignore_errors=True)
             return UpdateResult(success=True, message=f"已回滚到备份: {backup_name}")
         except Exception as exc:
             return UpdateResult(success=False, message=f"回滚失败: {exc}")
+        finally:
+            if extract_dir is not None:
+                shutil.rmtree(extract_dir, ignore_errors=True)
 
 
 def _sha256_file(path: Path) -> str:

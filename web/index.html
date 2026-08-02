@@ -178,12 +178,16 @@
             <div class="panel-head">
               <div>
                 <p class="eyebrow">Receipt Studio</p>
-                <h2>小票可视化编辑器</h2>
+                <h2 id="receiptEditorTitle">小票可视化编辑器</h2>
               </div>
               <span id="receiptSaveState" class="state-chip">未修改</span>
             </div>
 
             <div class="receipt-toolbar">
+              <div class="receipt-template-switch" role="group" aria-label="模板类型">
+                <button type="button" class="receipt-mode-button is-active" data-receipt-mode="receipt">顾客小票</button>
+                <button type="button" class="receipt-mode-button" data-receipt-mode="kitchen">厨房单</button>
+              </div>
               <label class="field receipt-name-field">
                 <span>模板名称</span>
                 <input id="receiptTemplateName" value="默认结账小票" maxlength="80" />
@@ -204,7 +208,7 @@
               <section class="receipt-block-column" aria-label="小票区块">
                 <div class="studio-column-head">
                   <div>
-                    <h3>小票区块</h3>
+                    <h3 id="receiptBlockHeading">小票区块</h3>
                     <p>拖动调整打印顺序</p>
                   </div>
                 </div>
@@ -223,7 +227,7 @@
                     <p id="receiptInspectorHint">选择左侧区块进行编辑</p>
                   </div>
                 </div>
-                <div id="receiptInspectorEmpty" class="inspector-empty">请选择一个小票区块</div>
+                <div id="receiptInspectorEmpty" class="inspector-empty">请选择一个区块</div>
                 <form id="receiptInspectorForm" class="receipt-inspector-form hidden">
                   <label class="toggle-row editor-toggle">
                     <input id="receiptBlockEnabled" type="checkbox" />
@@ -322,7 +326,7 @@
               <section class="receipt-preview-column" aria-label="小票预览">
                 <div class="studio-column-head preview-head">
                   <div>
-                    <h3>实时预览</h3>
+                    <h3 id="receiptPreviewHeading">顾客小票实时预览</h3>
                     <p>显示 Odoo 原始字段名，不会触发打印</p>
                   </div>
                   <span id="receiptPreviewWidth" class="preview-size-chip">48 字符</span>
@@ -398,6 +402,6 @@
         </section>
       </section>
     </main>
-    <script src="/assets/app.js?v=20260801-field-layout" defer></script>
+    <script src="/assets/app.js?v=20260801-kitchen-template" defer></script>
   </body>
 </html>

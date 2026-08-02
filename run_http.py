@@ -74,7 +74,9 @@ def main() -> None:
         port=port,
         log_level="info",
         log_config=None,
-        access_log=True,
+        access_log=os.getenv("IOT_ACCESS_LOG", "0").strip().lower() in {"1", "true", "yes", "on"},
+        timeout_keep_alive=max(5, int(os.getenv("IOT_HTTP_KEEP_ALIVE_SECONDS", "30"))),
+        backlog=max(128, int(os.getenv("IOT_HTTP_BACKLOG", "2048"))),
     )
 
 

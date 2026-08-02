@@ -15,6 +15,7 @@
   },
   "config": {
     "name": "主收银台",
+    "_base_url": "https://odoo.example.com",
     "receipt_language": "es_ES",
     "receipt_footer": "谢谢惠顾\n欢迎再次光临"
   },

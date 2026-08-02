@@ -64,23 +64,6 @@ function renderDefinitionList(targetId, rows) {
   }
 }
 
-function prettyJSON(value) {
-  return JSON.stringify(value, null, 2);
-}
-
-function parseEditorJSON(id, label) {
-  try {
-    return JSON.parse(el(id).value);
-  } catch (error) {
-    throw new Error(`${label} is not valid JSON: ${error.message}`);
-  }
-}
-
-function deviceTypeIcon(type) {
-  if (type === "printer") return "PR";
-  return "IO";
-}
-
 function buildLocalUrl(ip, sslEngine) {
   if (!ip) return "";
   const scheme = sslEngine === "plain_http" ? "http" : "https";
@@ -134,24 +117,22 @@ function renderCloudBridge(cloudBridge) {
 function renderCertificates(certificates) {
   const parts = [];
   if (certificates?.crt_ready) parts.push("CRT ready");
-  if (certificates?.p12_ready) parts.push(`P12 password: ${certificates.password_hint || "-"}`);
+  if (certificates?.p12_ready) parts.push("P12 ready");
+  if (certificates?.password_file) parts.push(`Password file: ${certificates.password_file}`);
   if (certificates?.startup_error) parts.push(`Startup error: ${certificates.startup_error}`);
   setFeedback("certHint", parts.join(" | ") || "Certificates unavailable", parts.length ? "success" : "");
 }
 
 function renderDevices(devices) {
   const list = el("deviceList");
-  const eventSelect = el("deviceIdentifier");
   if (!list) return;
   clearNode(list);
-  clearNode(eventSelect);
 
   if (!devices?.length) {
     const empty = document.createElement("p");
     empty.className = "feedback";
     empty.textContent = "No devices reported by the runtime.";
     list.appendChild(empty);
-    if (eventSelect) appendOption(eventSelect, "", "No devices");
     return;
   }
 
@@ -194,7 +175,6 @@ function renderDevices(devices) {
     item.appendChild(badge);
     list.appendChild(item);
 
-    if (eventSelect) appendOption(eventSelect, device.identifier, `${device.name} (${device.identifier})`);
   }
 }
 
@@ -281,21 +261,6 @@ async function connectWithTokenUrl(tokenUrl) {
 
 async function disconnectServer() {
   await getJSON("/api/disconnect", { method: "POST" });
-}
-
-async function triggerPrintTest(url, successMessage) {
-  setFeedback("printFeedback", "Submitting print job to native runtime...", "warn");
-  try {
-    const result = await getJSON(url, { method: "POST" });
-    setFeedback(
-      "printFeedback",
-      result?.message || successMessage,
-      result?.ok ? "success" : "error"
-    );
-  } catch (error) {
-    console.error(error);
-    setFeedback("printFeedback", error.message || "Print test failed.", "error");
-  }
 }
 
 el("sslEngine").addEventListener("change", () => {
@@ -425,7 +390,6 @@ async function saveScaleConfig() {
     scale_port: el("scalePort").value,
     scale_baudrate: parseInt(el("scaleBaudrate").value) || 9600,
     scale_timeout: parseFloat(el("scaleTimeout").value) || 1.2,
-    scale_sse_enabled: false,
   };
   await getJSON("/api/scale/save_config", {
     method: "POST",
@@ -492,15 +456,33 @@ let selectedReceiptBlockId = null;
 let draggedReceiptBlockId = null;
 let receiptHistory = [];
 let receiptPreviewTimer = null;
+let receiptTemplateMode = "receipt";
+let receiptTemplateDirty = false;
 
 function cloneReceiptTemplate(value) {
   return JSON.parse(JSON.stringify(value));
 }
 
 function setReceiptDirty(dirty) {
+  receiptTemplateDirty = dirty;
   const chip = el("receiptSaveState");
   chip.textContent = dirty ? "有未保存修改" : "已保存";
   chip.className = `state-chip ${dirty ? "state-chip-warn" : "state-chip-ok"}`;
+}
+
+function receiptTemplateEndpoint(suffix = "") {
+  const base = receiptTemplateMode === "kitchen" ? "/api/kitchen-template" : "/api/receipt-template";
+  return `${base}${suffix}`;
+}
+
+function updateReceiptModeUI() {
+  const kitchen = receiptTemplateMode === "kitchen";
+  el("receiptEditorTitle").textContent = kitchen ? "厨房单可视化编辑器" : "小票可视化编辑器";
+  el("receiptBlockHeading").textContent = kitchen ? "厨房单区块" : "小票区块";
+  el("receiptPreviewHeading").textContent = kitchen ? "厨房单实时预览" : "顾客小票实时预览";
+  for (const button of document.querySelectorAll("[data-receipt-mode]")) {
+    button.classList.toggle("is-active", button.dataset.receiptMode === receiptTemplateMode);
+  }
 }
 
 function rememberReceiptTemplate() {
@@ -589,7 +571,10 @@ function selectReceiptBlock(blockId) {
   el("receiptInspectorForm").classList.toggle("hidden", !block);
   if (block) {
     const kind = block.kind || "builtin";
-    const canOverrideContent = kind === "builtin" && ["company", "invoice", "order_info", "product_header", "footer"].includes(block.id);
+    const editableBuiltins = receiptTemplateMode === "kitchen"
+      ? ["order_type", "status", "order_meta", "location", "time"]
+      : ["company", "invoice", "order_info", "product_header", "footer"];
+    const canOverrideContent = kind === "builtin" && editableBuiltins.includes(block.id);
     el("receiptInspectorHint").textContent = block.label;
     el("receiptBlockEnabled").checked = Boolean(block.enabled);
     el("receiptBlockAlign").value = block.align || "inherit";
@@ -683,17 +668,41 @@ function scheduleReceiptPreview() {
   receiptPreviewTimer = window.setTimeout(previewReceiptTemplate, 120);
 }
 
+function receiptCellWidth(value) {
+  let width = 0;
+  for (const character of Array.from(String(value || ""))) {
+    const code = character.codePointAt(0);
+    if ((code >= 0x0300 && code <= 0x036f) || (code >= 0xfe00 && code <= 0xfe0f)) continue;
+    const wide =
+      code >= 0x1100 &&
+      (code <= 0x115f ||
+        code === 0x2329 || code === 0x232a ||
+        (code >= 0x2e80 && code <= 0xa4cf) ||
+        (code >= 0xac00 && code <= 0xd7a3) ||
+        (code >= 0xf900 && code <= 0xfaff) ||
+        (code >= 0xfe10 && code <= 0xfe6f) ||
+        (code >= 0xff00 && code <= 0xff60) ||
+        (code >= 0xffe0 && code <= 0xffe6) ||
+        (code >= 0x1f300 && code <= 0x1faff));
+    width += wide ? 2 : 1;
+  }
+  return width;
+}
+
 function receiptLineText(line, width) {
-  if (line.type === "image") return `[ 图片 · ${line.image_kind || "image"} ]`;
+  if (line.type === "image") {
+    if (line.image_kind === "barcode") return String(line.barcode_value || "{{ pos_reference }}");
+    return `[ 图片 · ${line.image_kind || "image"} ]`;
+  }
   if (line.type === "header_meta_line") {
     const left = String(line.left_text || "");
     const right = String(line.right_text || "");
-    return `${left}${" ".repeat(Math.max(1, width - left.length - right.length))}${right}`;
+    return `${left}${" ".repeat(Math.max(1, width - receiptCellWidth(left) - receiptCellWidth(right)))}${right}`;
   }
   if (line.type === "product_line") {
     const left = `${line.qty || ""} x ${line.name || ""}`.trim();
     const right = String(line.total || "");
-    return `${left}${" ".repeat(Math.max(1, width - left.length - right.length))}${right}`;
+    return `${left}${" ".repeat(Math.max(1, width - receiptCellWidth(left) - receiptCellWidth(right)))}${right}`;
   }
   return String(line.text || "");
 }
@@ -711,7 +720,17 @@ function renderReceiptPreview(lines, width) {
     if (line.bold) row.classList.add("is-bold");
     if (line.double_width || line.double_height) row.classList.add("is-double");
     if (line.type === "image") row.classList.add("is-image");
-    row.textContent = receiptLineText(line, width) || " ";
+    if (line.type === "image" && line.image_kind === "barcode") {
+      row.classList.add("is-barcode");
+      const bars = document.createElement("span");
+      bars.className = "receipt-barcode-bars";
+      const value = document.createElement("span");
+      value.className = "receipt-barcode-value";
+      value.textContent = receiptLineText(line, width);
+      row.append(bars, value);
+    } else {
+      row.textContent = receiptLineText(line, width) || " ";
+    }
     paper.appendChild(row);
     for (const option of line.combo_items || []) {
       const optionRow = document.createElement("div");
@@ -728,7 +747,7 @@ async function previewReceiptTemplate() {
   requested.name = el("receiptTemplateName").value.trim() || "自定义小票";
   requested.paper_width = Number(el("receiptPaperWidth").value) || 48;
   try {
-    const result = await getJSON("/api/receipt-template/preview", {
+    const result = await getJSON(receiptTemplateEndpoint("/preview"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(requested),
@@ -742,7 +761,8 @@ async function previewReceiptTemplate() {
 
 async function loadReceiptEditor() {
   try {
-    const result = await getJSON("/api/receipt-template");
+    updateReceiptModeUI();
+    const result = await getJSON(receiptTemplateEndpoint());
     receiptTemplate = result.template;
     receiptHistory = [];
     el("receiptTemplateName").value = receiptTemplate.name;
@@ -753,7 +773,7 @@ async function loadReceiptEditor() {
     el("receiptUndo").disabled = true;
     await previewReceiptTemplate();
   } catch (error) {
-    setFeedback("receiptFeedback", error.message || "无法加载小票模板", "error");
+    setFeedback("receiptFeedback", error.message || "无法加载模板", "error");
   }
 }
 
@@ -891,7 +911,7 @@ el("receiptSave").addEventListener("click", async () => {
   receiptTemplate.paper_width = Number(el("receiptPaperWidth").value) || 48;
   setFeedback("receiptFeedback", "正在保存模板…", "warn");
   try {
-    const result = await getJSON("/api/receipt-template", {
+    const result = await getJSON(receiptTemplateEndpoint(), {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(receiptTemplate),
@@ -900,16 +920,18 @@ el("receiptSave").addEventListener("click", async () => {
     receiptHistory = [];
     el("receiptUndo").disabled = true;
     setReceiptDirty(false);
-    setFeedback("receiptFeedback", "模板已保存，下一张小票会使用新布局。", "success");
+    const target = receiptTemplateMode === "kitchen" ? "厨房单" : "顾客小票";
+    setFeedback("receiptFeedback", `模板已保存，下一张${target}会使用新布局。`, "success");
   } catch (error) {
     setFeedback("receiptFeedback", error.message || "保存失败", "error");
   }
 });
 el("receiptReset").addEventListener("click", async () => {
-  if (!window.confirm("恢复默认小票布局？当前已保存的模板会被替换。")) return;
+  const target = receiptTemplateMode === "kitchen" ? "厨房单" : "顾客小票";
+  if (!window.confirm(`恢复默认${target}布局？当前已保存的模板会被替换。`)) return;
   rememberReceiptTemplate();
   try {
-    const result = await getJSON("/api/receipt-template", { method: "DELETE" });
+    const result = await getJSON(receiptTemplateEndpoint(), { method: "DELETE" });
     receiptTemplate = result.template;
     el("receiptTemplateName").value = receiptTemplate.name;
     el("receiptPaperWidth").value = String(receiptTemplate.paper_width);
@@ -922,5 +944,18 @@ el("receiptReset").addEventListener("click", async () => {
     setFeedback("receiptFeedback", error.message || "恢复失败", "error");
   }
 });
+
+for (const button of document.querySelectorAll("[data-receipt-mode]")) {
+  button.addEventListener("click", async () => {
+    const nextMode = button.dataset.receiptMode;
+    if (!nextMode || nextMode === receiptTemplateMode) return;
+    if (receiptTemplateDirty && !window.confirm("当前模板有未保存修改，切换后将丢失。继续切换？")) return;
+    receiptTemplateMode = nextMode;
+    receiptTemplate = null;
+    selectedReceiptBlockId = null;
+    receiptHistory = [];
+    await loadReceiptEditor();
+  });
+}
 
 loadReceiptEditor();
