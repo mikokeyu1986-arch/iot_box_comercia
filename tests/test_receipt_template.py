@@ -6,6 +6,7 @@ from pathlib import Path
 
 from app.receipt_builder import build_kitchen_ticket_lines, build_receipt_lines
 from app.kitchen_template_store import default_kitchen_template, save_kitchen_template
+from app.printing.text_layout import TextLayoutMixin
 from app.receipt_template_store import _cell_width, default_template, load_template, save_template, validate_template
 
 
@@ -16,6 +17,51 @@ SAMPLE_ORDER = json.loads(
 
 
 class ReceiptTemplateTests(unittest.TestCase):
+    def test_default_product_columns_fill_48_characters(self):
+        template = validate_template(default_template())
+        header = next(block for block in template["blocks"] if block["id"] == "product_header")
+
+        widths = (
+            header["qty_columns"],
+            header["product_columns"],
+            header["gutter_columns"],
+            header["amount_columns"],
+        )
+        self.assertEqual(widths, (6, 30, 2, 10))
+        self.assertEqual(sum(widths), 48)
+
+    def test_default_escpos_encoding_prints_real_euro_glyph(self):
+        class EncodingRenderer(TextLayoutMixin):
+            def _normalize_print_text(self, text):
+                return str(text)
+
+        renderer = EncodingRenderer()
+        encoding, codepage = renderer._escpos_encoding_config()
+
+        self.assertEqual((encoding, codepage), ("cp858", 19))
+        self.assertEqual("€".encode(encoding), b"\xd5")
+        self.assertEqual(renderer._escpos_safe_text("8.50 €", encoding), "8.50 €")
+
+    def test_escpos_preserves_preformatted_product_column_spaces(self):
+        renderer = TextLayoutMixin()
+        header = "Uds.  Producto                           Importe"
+        product = "6     Producto plantilla                 13.90 €"
+
+        self.assertEqual(
+            renderer._render_escpos_lines(
+                {"text": header, "align": "left", "classes": ["receipt-product-header"]},
+                48,
+            ),
+            [header],
+        )
+        self.assertEqual(
+            renderer._render_escpos_lines(
+                {"text": product, "align": "left", "classes": ["receipt-product-row"]},
+                48,
+            ),
+            [product],
+        )
+
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.previous_path = os.environ.get("IOT_RECEIPT_TEMPLATE_PATH")
@@ -67,7 +113,7 @@ class ReceiptTemplateTests(unittest.TestCase):
         self.assertEqual(saved, load_template())
         self.assertIn("receipt-product-row", lines[0].get("classes", []))
         self.assertEqual(_cell_width(lines[0]["text"]), 48)
-        self.assertTrue(lines[0]["text"].endswith("17.00 €"))
+        self.assertTrue(lines[0]["text"].endswith("17,00 €"))
         self.assertFalse(any(line.get("text") == "示例餐厅" for line in lines))
 
     def test_unknown_blocks_are_rejected(self):
@@ -113,6 +159,54 @@ class ReceiptTemplateTests(unittest.TestCase):
         self.assertEqual(_cell_width(header["text"]), 48)
         self.assertTrue(header["text"].endswith("Importe"))
 
+    def test_explicit_gutter_leaves_unused_columns_after_amount(self):
+        template = validate_template(default_template())
+        header_block = next(block for block in template["blocks"] if block["id"] == "product_header")
+        header_block.update({
+            "qty_columns": 6,
+            "product_columns": 26,
+            "gutter_columns": 2,
+            "amount_columns": 10,
+        })
+
+        validated = validate_template(template)
+        saved_header = next(block for block in validated["blocks"] if block["id"] == "product_header")
+        lines = build_receipt_lines(SAMPLE_ORDER, template=validated)
+        header = next(line for line in lines if "receipt-product-header" in line.get("classes", []))
+
+        self.assertEqual(saved_header["gutter_columns"], 2)
+        self.assertEqual(_cell_width(header["text"]), 48)
+        self.assertEqual(header["text"][37:44], "Importe")
+        self.assertEqual(header["text"][44:], " " * 4)
+
+    def test_long_product_names_wrap_without_splitting_words(self):
+        template = validate_template(default_template())
+        header_block = next(block for block in template["blocks"] if block["id"] == "product_header")
+        header_block.update({
+            "qty_columns": 6,
+            "product_columns": 30,
+            "gutter_columns": 2,
+            "amount_columns": 10,
+        })
+        order = {
+            **SAMPLE_ORDER,
+            "lines": [{
+                "qty": "12,00",
+                "full_product_name": "Producto plantilla grande familiar especial",
+                "price_subtotal_incl": "100,00",
+            }],
+        }
+
+        lines = build_receipt_lines(order, template=template)
+        product_rows = [
+            line["text"] for line in lines
+            if "receipt-product-row" in line.get("classes", [])
+        ]
+
+        self.assertEqual(product_rows[0][6:36].rstrip(), "Producto plantilla grande")
+        self.assertEqual(product_rows[1][6:36].rstrip(), "familiar especial")
+        self.assertTrue(all(_cell_width(row) == 48 for row in product_rows))
+
     def test_native_odoo_discount_line_format(self):
         order = {
             **SAMPLE_ORDER,
@@ -135,6 +229,52 @@ class ReceiptTemplateTests(unittest.TestCase):
         ]
 
         self.assertEqual(discount_rows, ["50% de descuento en 13,90 €"])
+
+    def test_product_unit_price_and_total_use_euro_symbol(self):
+        lines = build_receipt_lines(SAMPLE_ORDER, template=default_template())
+        unit_rows = [
+            line["text"].strip()
+            for line in lines
+            if "receipt-product-unit-price-row" in line.get("classes", [])
+        ]
+        product_rows = [
+            line["text"]
+            for line in lines
+            if "receipt-product-row" in line.get("classes", [])
+        ]
+        total_line = next(
+            line["text"] for line in lines
+            if str(line.get("text") or "").startswith("TOTAL ")
+        )
+
+        self.assertIn("8,50 €", unit_rows)
+        self.assertTrue(product_rows[0].rstrip().endswith("17,00 €"))
+        self.assertEqual(total_line, "TOTAL 20,00 €")
+
+    def test_comma_decimal_quantity_and_total_are_preserved(self):
+        order = {
+            **SAMPLE_ORDER,
+            "lines": [{
+                "qty": "12,00",
+                "full_product_name": "Producto prueba especial largo",
+                "unit_price": "8,50",
+                "price_subtotal_incl": "100,00",
+            }],
+            "totalDue": "100,00",
+        }
+        lines = build_receipt_lines(order, template=default_template())
+        product = next(
+            line["text"] for line in lines
+            if "receipt-product-row" in line.get("classes", [])
+        )
+        total = next(
+            line["text"] for line in lines
+            if str(line.get("text") or "").startswith("TOTAL ")
+        )
+
+        self.assertTrue(product.startswith("12,00 "))
+        self.assertTrue(product.rstrip().endswith("100,00 €"))
+        self.assertEqual(total, "TOTAL 100,00 €")
 
     def test_editor_preview_uses_field_names_and_total_owns_both_separators(self):
         lines = build_receipt_lines(SAMPLE_ORDER, template=default_template(), preview_fields=True)

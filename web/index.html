@@ -268,7 +268,7 @@
                     <small>每一行会单独打印；留空可恢复动态订单内容。</small>
                   </label>
                   <div id="receiptProductHeaderFields" class="product-header-editor hidden">
-                    <p class="product-header-total">三列占用不超过 <strong>48</strong> 字符，剩余位置自动作为商品与金额的安全间距。</p>
+                    <p class="product-header-total">各列与留白合计不超过 <strong>48</strong> 字符；未使用位置保留在金额列右侧。</p>
                     <label class="field">
                       <span>数量列文字</span>
                       <input id="receiptQtyLabel" maxlength="12" value="Uds." />
@@ -283,7 +283,7 @@
                     </label>
                     <label class="field">
                       <span>商品列宽</span>
-                      <input id="receiptProductColumns" type="number" min="12" max="32" value="28" />
+                      <input id="receiptProductColumns" type="number" min="12" max="32" value="30" />
                     </label>
                     <label class="field">
                       <span>金额列文字</span>
@@ -294,8 +294,8 @@
                       <input id="receiptAmountColumns" type="number" min="8" max="16" value="10" />
                     </label>
                     <label class="field field-wide">
-                      <span>商品与金额安全间距（自动）</span>
-                      <input id="receiptColumnGutter" type="number" value="4" readonly />
+                      <span>商品与金额安全间距</span>
+                      <input id="receiptColumnGutter" type="number" min="0" max="12" value="2" />
                     </label>
                   </div>
                   <label id="receiptCustomTextField" class="field hidden">

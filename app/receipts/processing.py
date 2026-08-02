@@ -264,7 +264,11 @@ class ReceiptProcessingMixin:
                     lines,
                     cut=bool(payload.get("cut", True)),
                     payload=payload,
-                    normalize_lines=True,
+                    # Raw Odoo orders and structured receipts have already
+                    # passed through the visual template. Normalizing them a
+                    # second time collapses the significant spaces used by
+                    # the configured 48-column product layout.
+                    normalize_lines=not skip_normalize,
                 )
             build_duration_ms = (time() - build_started_at) * 1000
             write_started_at = time()

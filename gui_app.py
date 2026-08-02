@@ -54,8 +54,6 @@ _CONFIG_DEFAULT = BASE_DIR / "runtime_config.json"
 # store before the service starts, so an HTTP file can never hijack HTTPS.
 CONFIG_FILE = _CONFIG_DEFAULT
 
-DEFAULT_ODOO_URL = "http://192.168.1.1:8069"
-DEFAULT_TOKEN_URL = "http://192.168.1.1:8069"
 DEFAULT_SCALE_PORT = "COM3"
 DEFAULT_SCALE_BAUDRATE = 9600
 
@@ -250,10 +248,16 @@ class SettingsWindow(tk.Toplevel):
         if protocol not in {"http", "https"}:
             protocol = "https"
         self._activate_protocol_config(protocol)
-        self.config_store.update_local_config(
-            service_protocol=protocol,
-            auto_start_service=bool(self.auto_start_var.get()),
-        )
+        preferences = {
+            "service_protocol": protocol,
+            "auto_start_service": bool(self.auto_start_var.get()),
+        }
+        self.config_store.update_local_config(**preferences)
+        if self.config_store.config_path.resolve() != _CONFIG_DEFAULT.resolve():
+            # The default store is also the GUI bootstrap store.  Keep only
+            # launcher preferences there so the next run can reopen the
+            # selected protocol without mixing the two runtime stores.
+            ConfigStore(_CONFIG_DEFAULT).update_local_config(**preferences)
         self._append_log(f"服务设置已保存: protocol={protocol}, auto_start={self.auto_start_var.get()}")
 
     def _activate_protocol_config(self, protocol: str) -> None:
@@ -629,10 +633,20 @@ class SettingsWindow(tk.Toplevel):
         self._close_customer_display_screen()
         url = self.customer_display_url_var.get().strip()
         try:
+            from ctypes import wintypes
+
             monitors = []
-            callback = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_long * 4), ctypes.c_double)
+            callback = ctypes.WINFUNCTYPE(
+                wintypes.BOOL,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(wintypes.RECT),
+                wintypes.LPARAM,
+            )
+
             def enum_proc(_monitor, _dc, rect, _data):
-                monitors.append(tuple(rect.contents))
+                bounds = rect.contents
+                monitors.append((bounds.left, bounds.top, bounds.right, bounds.bottom))
                 return True
             ctypes.windll.user32.EnumDisplayMonitors(None, None, callback(enum_proc), 0)
             if len(monitors) < 2:
@@ -657,20 +671,6 @@ class SettingsWindow(tk.Toplevel):
         if process is not None and process.poll() is None:
             process.terminate()
         self.customer_display_proc = None
-        window = getattr(self, "customer_display_webview", None)
-        if window is not None:
-            try:
-                window.destroy()
-            except Exception:
-                pass
-            self.customer_display_webview = None
-        window = getattr(self, "customer_display_window", None)
-        if window is not None:
-            try:
-                window.destroy()
-            except tk.TclError:
-                pass
-            self.customer_display_window = None
 
     def _stop_all_customer_display_processes(self) -> None:
         """清理可能由旧版 GUI 留下的重复客户屏进程。"""
@@ -688,23 +688,6 @@ class SettingsWindow(tk.Toplevel):
             )
         except Exception:
             pass
-
-    def _run_customer_display_webview(self, url: str, left: int, top: int, width: int, height: int) -> None:
-        try:
-            import webview
-            self.customer_display_webview = webview.create_window(
-                "Pantalla del cliente",
-                url=url,
-                x=left,
-                y=top,
-                width=width,
-                height=height,
-                fullscreen=True,
-                resizable=False,
-            )
-            webview.start(gui="edgechromium", debug=False)
-        except Exception as exc:
-            self.after(0, self.customer_display_status_var.set, f"客户屏幕启动失败: {exc}")
 
     def _refresh_ports(self) -> None:
         """扫描可用串口"""
@@ -1126,14 +1109,17 @@ class TrayApplication:
 
         def on_quit(icon, item):
             icon.stop()
-            # 在主线程销毁 tk 窗口
-            root.after(0, root.destroy)
+            root.after(0, self._shutdown, root)
 
         def on_settings(icon, item):
             root.after(0, self._show_settings, root)
 
         def on_open_web(icon, item):
-            webbrowser.open(f"http://127.0.0.1:{HTTP_PORT}")
+            local = self.config_store.get_local_config()
+            protocol = str(local.get("service_protocol") or "https").strip().lower()
+            protocol = protocol if protocol in {"http", "https"} else "https"
+            port = HTTP_PORT if protocol == "http" else HTTPS_PORT
+            webbrowser.open(f"{protocol}://127.0.0.1:{port}")
 
         # 图标
         icon_image = self._load_icon(pystray)
@@ -1165,6 +1151,18 @@ class TrayApplication:
 
         # 主线程运行 tkinter 事件循环
         root.mainloop()
+
+    def _shutdown(self, root: Tk) -> None:
+        """Stop child processes owned by the GUI before leaving the tray app."""
+        window = self.settings_window
+        try:
+            window_exists = window is not None and bool(window.winfo_exists())
+        except tk.TclError:
+            window_exists = False
+        if window_exists:
+            window._close_customer_display_screen()
+            window._stop_service_process()
+        root.destroy()
 
     # ------------------------------------------------------------------
 

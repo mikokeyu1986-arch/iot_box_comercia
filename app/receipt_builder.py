@@ -119,11 +119,8 @@ def _text(value: Any) -> str:
 
 
 def _decimal(value: Any) -> Decimal:
-    try:
-        d = Decimal(str(value))
-        return d if d.is_finite() else Decimal("0")
-    except (InvalidOperation, ValueError, TypeError):
-        return Decimal("0")
+    parsed = _parse_decimal(value)
+    return parsed if parsed is not None and parsed.is_finite() else Decimal("0")
 
 
 def _parse_decimal(value: Any) -> Decimal | None:
@@ -148,9 +145,11 @@ def _parse_decimal(value: Any) -> Decimal | None:
 def _money(order: dict[str, Any], amount: Any) -> str:
     amt = _decimal(amount)
     currency = order.get("currency", {}) or {}
-    symbol = _text(currency.get("symbol") or "$")
+    symbol = _text(currency.get("symbol") or "€")
     position = str(currency.get("position", "after")).strip().lower()
     formatted = f"{amt:.2f}"
+    if symbol == "€":
+        formatted = formatted.replace(".", ",")
     if position == "before":
         return f"{symbol}{formatted}"
     return f"{formatted} {symbol}"
@@ -217,6 +216,15 @@ def _line_discounted_unit_price(line: dict[str, Any]) -> Decimal:
         "unit_price", "unitPrice", "price_unit", "priceUnit",
         "display_price", "displayPrice",
     ])
+
+
+def _line_display_unit_price(line: dict[str, Any], total: Decimal) -> Decimal:
+    """Return Odoo's unit price, deriving it from total/quantity if absent."""
+    unit_price = _line_discounted_unit_price(line)
+    if unit_price > 0:
+        return unit_price
+    qty = _line_qty(line)
+    return total / qty if qty > 0 and total > 0 else Decimal("0")
 
 
 def _line_qty(line: dict[str, Any]) -> Decimal:
@@ -311,6 +319,10 @@ def _calculate_subtotal(order: dict[str, Any]) -> Decimal:
 
 def _qty_text(line: dict[str, Any]) -> str:
     qty = line.get("qty") or line.get("quantity") or 0
+    if isinstance(qty, str):
+        raw_qty = qty.strip()
+        if "," in raw_qty:
+            return raw_qty
     d = _parse_decimal(qty)
     if d is None:
         return "0"
@@ -834,6 +846,7 @@ def build_receipt_lines(
             "type": "product_line",
             "qty": _qty_text(raw_line),
             "name": name,
+            "unit_price": _money(order, _line_display_unit_price(raw_line, discounted)),
             "total": _money(order, discounted),
             "combo_items": options,
         }
@@ -880,7 +893,7 @@ def build_receipt_lines(
         lines.append({
             "type": "header_meta_line",
             "left_text": L["DISCOUNT"],
-            "right_text": f"-{amt:.2f}",
+            "right_text": f"-{_money(order, amt)}",
         })
 
     # ══════════════════════════════════════════════════════════════════
@@ -902,9 +915,8 @@ def build_receipt_lines(
     lines.append({"text": SEPARATOR, "align": "left"})
     total_due = order.get("totalDue")
     if total_due is not None:
-        amt = _decimal(total_due)
         lines.append({
-            "text": f"{L['TOTAL']} {amt:.2f} €",
+            "text": f"{L['TOTAL']} {_money(order, total_due)}",
             "align": "center", "bold": True,
             "double_width": True, "double_height": True,
         })
@@ -1106,6 +1118,7 @@ def _replace_with_field_placeholders(lines: list[dict[str, Any]]) -> list[dict[s
             "type": "product_line",
             "qty": "qty",
             "name": "full_product_name",
+            "unit_price": "unit_price",
             "total": "price_subtotal_incl",
             "discount_text": "discount%",
             "original_total": "price_without_discount",

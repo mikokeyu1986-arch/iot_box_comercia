@@ -10,6 +10,7 @@ import shutil
 import threading
 import unicodedata
 from copy import deepcopy
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -124,10 +125,20 @@ def validate_template(payload: Any) -> dict[str, Any]:
                 except (TypeError, ValueError):
                     amount_columns = 10
                 try:
-                    product_columns = max(12, min(32, int(raw.get("product_columns") or 28)))
+                    product_columns = max(12, min(32, int(raw.get("product_columns") or 30)))
                 except (TypeError, ValueError):
-                    product_columns = 28
-                product_columns = min(product_columns, 48 - qty_columns - amount_columns)
+                    product_columns = 30
+                default_gutter = max(0, 48 - qty_columns - product_columns - amount_columns)
+                try:
+                    raw_gutter = raw.get("gutter_columns", default_gutter)
+                    gutter_columns = max(0, min(12, int(raw_gutter)))
+                except (TypeError, ValueError):
+                    gutter_columns = default_gutter
+                # The configured columns may use fewer than 48 characters;
+                # any remainder stays after the amount column instead of
+                # being silently added back into the product/amount gutter.
+                gutter_columns = min(gutter_columns, max(0, 48 - qty_columns - amount_columns - 12))
+                product_columns = min(product_columns, 48 - qty_columns - gutter_columns - amount_columns)
                 block.update({
                     "qty_label": str(raw.get("qty_label") or "Uds.")[:12],
                     "product_label": str(raw.get("product_label") or "Producto")[:32],
@@ -135,7 +146,7 @@ def validate_template(payload: Any) -> dict[str, Any]:
                     "qty_columns": qty_columns,
                     "product_columns": product_columns,
                     "amount_columns": amount_columns,
-                    "gutter_columns": 48 - qty_columns - product_columns - amount_columns,
+                    "gutter_columns": gutter_columns,
                 })
         elif kind == "text":
             block["text"] = str(raw.get("text") or "")[:1000]
@@ -162,8 +173,8 @@ def validate_template(payload: Any) -> dict[str, Any]:
             if block_id == "product_header":
                 new_block.update({
                     "qty_label": "Uds.", "product_label": "Producto", "amount_label": "Importe",
-                    "qty_columns": 6, "product_columns": 28, "amount_columns": 10,
-                    "gutter_columns": 4,
+                    "qty_columns": 6, "product_columns": 30, "amount_columns": 10,
+                    "gutter_columns": 2,
                 })
             insert_at = next(
                 (
@@ -219,7 +230,7 @@ def apply_template(lines: list[dict[str, Any]], template: dict[str, Any] | None 
     selected = validate_template(template or load_template())
     product_header = next(
         (block for block in selected["blocks"] if block["id"] == "product_header"),
-        {"qty_columns": 6, "product_columns": 28, "amount_columns": 10, "gutter_columns": 4},
+        {"qty_columns": 6, "product_columns": 30, "amount_columns": 10, "gutter_columns": 2},
     )
     grouped: dict[str, list[dict[str, Any]]] = {key: [] for key in BLOCK_IDS}
     untagged: list[dict[str, Any]] = []
@@ -292,8 +303,8 @@ def _render_product_header(line: dict[str, Any], width: int, block: dict[str, An
     amount = str(block.get("amount_label") or line.get("amount_label") or "Importe")
     qty_width = int(block.get("qty_columns") or 6)
     amount_width = int(block.get("amount_columns") or 10)
-    product_width = int(block.get("product_columns") or 28)
-    gutter_width = max(0, width - qty_width - product_width - amount_width)
+    product_width = int(block.get("product_columns") or 30)
+    gutter_width = max(0, int(block.get("gutter_columns", width - qty_width - product_width - amount_width)))
     text = (
         _pad_right(qty, qty_width)
         + _pad_right(product, product_width)
@@ -301,7 +312,7 @@ def _render_product_header(line: dict[str, Any], width: int, block: dict[str, An
         + _pad_left(amount, amount_width)
     )
     return {
-        "text": text[:width],
+        "text": _pad_right(text, width),
         "align": "left",
         "bold": bool(line.get("bold", True)),
         "classes": ["receipt-product-header"],
@@ -311,8 +322,8 @@ def _render_product_header(line: dict[str, Any], width: int, block: dict[str, An
 def _render_product_lines(line: dict[str, Any], layout: dict[str, Any], width: int) -> list[dict[str, Any]]:
     qty_width = int(layout.get("qty_columns") or 6)
     amount_width = int(layout.get("amount_columns") or 10)
-    product_width = int(layout.get("product_columns") or 28)
-    gutter_width = max(0, width - qty_width - product_width - amount_width)
+    product_width = int(layout.get("product_columns") or 30)
+    gutter_width = max(0, int(layout.get("gutter_columns", width - qty_width - product_width - amount_width)))
     qty = str(line.get("qty") or "")
     name_parts = _wrap_cells(str(line.get("name") or ""), product_width) or [""]
     amount = str(line.get("total") or "")
@@ -329,7 +340,7 @@ def _render_product_lines(line: dict[str, Any], layout: dict[str, Any], width: i
             + _pad_left(amount_part, amount_width)
         )
         rows.append({
-            "text": text,
+            "text": _pad_right(text, width),
             "align": "left",
             "bold": bool(line.get("bold", False)),
             "classes": ["receipt-product-row"],
@@ -337,12 +348,23 @@ def _render_product_lines(line: dict[str, Any], layout: dict[str, Any], width: i
     for option in line.get("combo_items") or []:
         for option_part in _wrap_cells(f"+ {option}", product_width):
             rows.append({
-                "text": (
+                "text": _pad_right((
                     _pad_right("", qty_width) + _pad_right(option_part, product_width)
                     + (" " * gutter_width) + _pad_left("", amount_width)
-                ),
+                ), width),
                 "align": "left",
                 "classes": ["receipt-product-option-row"],
+            })
+    unit_price = str(line.get("unit_price") or "").strip()
+    if unit_price and _show_unit_price(qty):
+        for unit_part in _wrap_cells(unit_price, product_width):
+            rows.append({
+                "text": _pad_right((
+                    _pad_right("", qty_width) + _pad_right(unit_part, product_width)
+                    + (" " * gutter_width) + _pad_left("", amount_width)
+                ), width),
+                "align": "left",
+                "classes": ["receipt-product-unit-price-row"],
             })
     discount = str(line.get("discount_text") or "").strip()
     if discount:
@@ -354,10 +376,10 @@ def _render_product_lines(line: dict[str, Any], layout: dict[str, Any], width: i
         )
         for discount_part in _wrap_cells(discount_text, product_width):
             rows.append({
-                "text": (
+                "text": _pad_right((
                     _pad_right("", qty_width) + _pad_right(discount_part, product_width)
                     + (" " * gutter_width) + _pad_left("", amount_width)
-                ),
+                ), width),
                 "align": "left",
                 "classes": ["receipt-product-discount-row"],
             })
@@ -366,6 +388,13 @@ def _render_product_lines(line: dict[str, Any], layout: dict[str, Any], width: i
 
 def _spanish_decimal_money(value: str) -> str:
     return re.sub(r"(?<=\d)\.(?=\d{2}(?:\s*(?:€|EUR))?$)", ",", value)
+
+
+def _show_unit_price(qty: str) -> bool:
+    try:
+        return Decimal(str(qty).strip().replace(",", ".")) != Decimal("1")
+    except (InvalidOperation, ValueError):
+        return True
 
 
 def _cell_width(text: str) -> int:
@@ -385,14 +414,20 @@ def _truncate_cells(text: str, width: int) -> str:
 
 
 def _wrap_cells(text: str, width: int) -> list[str]:
-    remaining = str(text)
+    remaining = str(text).strip()
     rows: list[str] = []
     while remaining:
         part = _truncate_cells(remaining, width)
         if not part:
             break
-        rows.append(part)
-        remaining = remaining[len(part):]
+        consumed = len(part)
+        if consumed < len(remaining) and not remaining[consumed].isspace():
+            word_boundary = part.rfind(" ")
+            if word_boundary > 0:
+                part = part[:word_boundary]
+                consumed = word_boundary + 1
+        rows.append(part.rstrip())
+        remaining = remaining[consumed:].lstrip()
     return rows
 
 
