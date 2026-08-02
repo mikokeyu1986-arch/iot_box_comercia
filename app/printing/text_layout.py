@@ -18,6 +18,24 @@ class TextLayoutMixin:
             return [str(line.get("text") or "").strip()]
         if line.get("type") == "header_meta_line":
             return self._render_header_meta_line(line, effective_width)
+        preformatted_product_classes = {
+            "receipt-product-header",
+            "receipt-product-row",
+            "receipt-product-option-row",
+            "receipt-product-unit-price-row",
+            "receipt-product-discount-row",
+        }
+        if preformatted_product_classes.intersection(classes):
+            # The visual template already placed every field in an exact
+            # character column. Re-parsing this text would collapse the
+            # configured quantity/product gutter back to one space.
+            text = str(line.get("text") or "").rstrip("\r\n")
+            rendered = ""
+            for char in text:
+                if self._text_width(rendered + char) > effective_width:
+                    break
+                rendered += char
+            return [rendered]
         text = str(line.get("text") or "").strip()
         if not text and {"receipt-spacer", "customer-spacer", "product-section-spacer", "payment-terminal-spacer"}.intersection(classes):
             return [""]
@@ -387,7 +405,10 @@ class TextLayoutMixin:
             return "cp1252", 16
         if configured in {"gb18030", "gbk", "cp936"}:
             return "gb18030", 255
-        return "gb18030", 255
+        # PC858 is the European ESC/POS code page.  Unlike CP850 it has a
+        # real euro glyph (Python encodes "€" as byte 0xD5), so Spanish POS
+        # receipts print the symbol instead of falling back to "EUR".
+        return "cp858", 19
     def _normalize_currency_text(self, text: str) -> str:
         if not text:
             return ""

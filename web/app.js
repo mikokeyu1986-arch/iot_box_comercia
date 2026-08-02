@@ -598,13 +598,8 @@ function selectReceiptBlock(blockId) {
     el("receiptAmountLabel").value = headerBlock.amount_label || "Importe";
     el("receiptQtyColumns").value = Number(headerBlock.qty_columns || 6);
     el("receiptAmountColumns").value = Number(headerBlock.amount_columns || 10);
-    el("receiptProductColumns").value = Number(headerBlock.product_columns || 28);
-    el("receiptColumnGutter").value = Math.max(
-      0,
-      48 - Number(headerBlock.qty_columns || 6)
-        - Number(headerBlock.product_columns || 28)
-        - Number(headerBlock.amount_columns || 10)
-    );
+    el("receiptProductColumns").value = Number(headerBlock.product_columns || 30);
+    el("receiptColumnGutter").value = Number(headerBlock.gutter_columns ?? 2);
     el("receiptCustomText").value = block.text || "";
     el("receiptSeparatorCharacter").value = block.character || "-";
     el("receiptSpacerLines").value = Number(block.lines || 1);
@@ -816,16 +811,19 @@ function updateProductHeaderColumns(changedField, rawValue) {
   if (!block || !["product_header", "products"].includes(selectedReceiptBlockId)) return;
   rememberReceiptTemplate();
   let qty = Math.max(5, Math.min(12, Number(block.qty_columns || 6)));
-  let product = Math.max(12, Math.min(32, Number(block.product_columns || 28)));
+  let product = Math.max(12, Math.min(32, Number(block.product_columns || 30)));
   let amount = Math.max(8, Math.min(16, Number(block.amount_columns || 10)));
+  let gutter = Math.max(0, Math.min(12, Number(block.gutter_columns ?? 2)));
   if (changedField === "qty_columns") qty = Math.max(5, Math.min(12, Number(rawValue) || 6));
-  if (changedField === "product_columns") product = Math.max(12, Math.min(32, Number(rawValue) || 28));
+  if (changedField === "product_columns") product = Math.max(12, Math.min(32, Number(rawValue) || 30));
   if (changedField === "amount_columns") amount = Math.max(8, Math.min(16, Number(rawValue) || 10));
-  product = Math.min(product, 48 - qty - amount);
+  if (changedField === "gutter_columns") gutter = Math.max(0, Math.min(12, Number(rawValue) || 0));
+  gutter = Math.min(gutter, Math.max(0, 48 - qty - amount - 12));
+  product = Math.min(product, 48 - qty - gutter - amount);
   block.qty_columns = qty;
   block.product_columns = product;
   block.amount_columns = amount;
-  block.gutter_columns = 48 - qty - product - amount;
+  block.gutter_columns = gutter;
   receiptTemplateChanged();
 }
 el("receiptQtyColumns").addEventListener("change", (event) => {
@@ -836,6 +834,9 @@ el("receiptAmountColumns").addEventListener("change", (event) => {
 });
 el("receiptProductColumns").addEventListener("change", (event) => {
   updateProductHeaderColumns("product_columns", event.target.value);
+});
+el("receiptColumnGutter").addEventListener("change", (event) => {
+  updateProductHeaderColumns("gutter_columns", event.target.value);
 });
 for (const [elementId, field] of [
   ["receiptQtyLabel", "qty_label"],

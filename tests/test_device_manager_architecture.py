@@ -55,6 +55,26 @@ class DeviceManagerArchitectureTests(unittest.TestCase):
         }
         self.assertEqual(required - owners.keys(), set())
 
+    def test_templated_receipts_skip_legacy_whitespace_normalization(self):
+        path = ROOT / "app" / "receipts" / "processing.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_build_escpos_bytes"
+        ]
+        self.assertEqual(len(calls), 1)
+        keyword = next(
+            (item for item in calls[0].keywords if item.arg == "normalize_lines"),
+            None,
+        )
+        self.assertIsNotNone(keyword)
+        self.assertIsInstance(keyword.value, ast.UnaryOp)
+        self.assertIsInstance(keyword.value.op, ast.Not)
+        self.assertIsInstance(keyword.value.operand, ast.Name)
+        self.assertEqual(keyword.value.operand.id, "skip_normalize")
+
 
 if __name__ == "__main__":
     unittest.main()

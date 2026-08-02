@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 from io import BytesIO
+import logging
+import os
+
 from PIL import Image
 from ..printing.common import CODE128_PATTERNS as _CODE128_PATTERNS
+
+_logger = logging.getLogger(__name__)
 
 class BarcodeMixin:
     def _generate_local_code128_png(self, data: str, query: dict[str, list[str]]) -> bytes:
