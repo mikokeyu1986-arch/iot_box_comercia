@@ -1,8 +1,8 @@
 {
-  "version": "2026.08.07",
-  "release_date": "2026-08-07",
-  "changelog": "Merge server binding into service control",
-  "download_url": "https://github.com/mikokeyu1986-arch/iot_box_comercia/releases/download/v2026.08.07/IOTBOX-SETUP.exe",
-  "checksum": "9530fec1eb89eade0f4b5e53c2a9e1999a7c4d153d72e8e2086a579bea6b93bd",
-  "file_size": 44477919
+  "version": "2026.08.08",
+  "release_date": "2026-08-08",
+  "changelog": "Use explicit IOTBOX icon for desktop shortcuts",
+  "download_url": "https://github.com/mikokeyu1986-arch/iot_box_comercia/releases/download/v2026.08.08/IOTBOX-SETUP.exe",
+  "checksum": "92f5d392f238011e60bbc5c1f09f73f1ae2709db0778e0859acf1d92709e53e7",
+  "file_size": 44566043
 }
