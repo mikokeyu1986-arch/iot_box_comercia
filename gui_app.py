@@ -30,7 +30,7 @@ from urllib.request import Request, urlopen
 from pathlib import Path
 import tkinter as tk
 from tkinter import Tk, StringVar, IntVar, BooleanVar
-from tkinter import ttk, messagebox
+from tkinter import ttk, messagebox, filedialog
 from tkinter.scrolledtext import ScrolledText
 from typing import Any
 
@@ -168,6 +168,48 @@ class SettingsWindow(tk.Toplevel):
         self.tab_about = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_about, text="  关于 & 更新  ")
         self._build_about_tab()
+
+        self.tab_diagnostics = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_diagnostics, text="  诊断日志  ")
+        self._build_diagnostics_tab()
+
+    def _build_diagnostics_tab(self) -> None:
+        frame = self.tab_diagnostics
+        toolbar = ttk.Frame(frame)
+        toolbar.pack(fill="x", padx=10, pady=10)
+        ttk.Button(toolbar, text="刷新日志", command=self._refresh_diagnostics).pack(side="left", padx=(0, 8))
+        ttk.Button(toolbar, text="清空显示", command=lambda: self.diagnostics_text.delete("1.0", "end")).pack(side="left", padx=(0, 8))
+        ttk.Button(toolbar, text="导出日志", command=self._export_diagnostics).pack(side="left")
+        ttk.Label(frame, text="仅用于开发排错；日志可能包含设备地址等运行信息，请勿直接公开。", foreground="gray").pack(anchor="w", padx=10)
+        self.diagnostics_text = ScrolledText(frame, state="disabled", wrap="none", font=("Consolas", 9))
+        self.diagnostics_text.pack(fill="both", expand=True, padx=10, pady=10)
+        self._refresh_diagnostics()
+
+    def _diagnostic_files(self) -> list[Path]:
+        paths = [BASE_DIR / "logs", BASE_DIR / "redsys" / "data"]
+        result: list[Path] = []
+        for directory in paths:
+            if directory.exists():
+                result.extend(p for p in directory.rglob("*") if p.is_file() and p.suffix.lower() in {".log", ".txt", ".json"})
+        return result
+
+    def _refresh_diagnostics(self) -> None:
+        chunks = []
+        for path in self._diagnostic_files():
+            try:
+                chunks.append(f"===== {path.relative_to(BASE_DIR)} =====\n{path.read_text(encoding='utf-8', errors='replace')[-200000:]}")
+            except OSError as exc:
+                chunks.append(f"===== {path.name} =====\n读取失败: {exc}")
+        text = "\n\n".join(chunks) or "当前没有可用日志。"
+        self.diagnostics_text.config(state="normal")
+        self.diagnostics_text.delete("1.0", "end")
+        self.diagnostics_text.insert("1.0", text)
+        self.diagnostics_text.config(state="disabled")
+
+    def _export_diagnostics(self) -> None:
+        target = filedialog.asksaveasfilename(defaultextension=".log", filetypes=[("Log files", "*.log"), ("All files", "*.*")])
+        if target:
+            Path(target).write_text(self.diagnostics_text.get("1.0", "end"), encoding="utf-8")
 
     # ==================================================================
     # 服务控制 Tab
