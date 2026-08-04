@@ -1,8 +1,8 @@
 {
-  "version": "2026.08.13",
-  "release_date": "2026-08-13",
-  "changelog": "Synchronize displayed application version with installer version",
-  "download_url": "https://github.com/mikokeyu1986-arch/iot_box_comercia/releases/download/v2026.08.13/IOTBOX-SETUP.exe",
-  "checksum": "68a2b88bfb1da252c301a12a96688ba18f2184b4ca9c7448ee860c8720682c53",
-  "file_size": 44584980
+  "version": "2026.08.14",
+  "release_date": "2026-08-14",
+  "changelog": "Do not terminate installer when stopping old GUI process",
+  "download_url": "https://github.com/mikokeyu1986-arch/iot_box_comercia/releases/download/v2026.08.14/IOTBOX-SETUP.exe",
+  "checksum": "6558cf46ca14adb72711ccf3756feb56d8bec5ab21d3c6bc6789e6bcdf9ce416",
+  "file_size": 44583254
 }

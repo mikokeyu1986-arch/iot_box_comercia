@@ -1,5 +1,5 @@
 #define AppName "IOTBOX"
-#define AppVersion "2026.08.13"
+#define AppVersion "2026.08.14"
 #define AppPublisher "IOTBOX"
 #define AppExeName "gui_app.exe"
 
@@ -39,9 +39,9 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
 begin
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM gui_app.exe', '', SW_HIDE,
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM gui_app.exe', '', SW_HIDE,
        ewWaitUntilTerminated, ResultCode);
-  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM run_http.exe', '', SW_HIDE,
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM run_http.exe', '', SW_HIDE,
        ewWaitUntilTerminated, ResultCode);
   Sleep(800);
   Result := '';
