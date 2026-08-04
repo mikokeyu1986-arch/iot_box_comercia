@@ -1,5 +1,5 @@
 #define AppName "IOTBOX"
-#define AppVersion "2026.08.09"
+#define AppVersion "2026.08.10"
 #define AppPublisher "IOTBOX"
 #define AppExeName "gui_app.exe"
 
@@ -16,8 +16,7 @@ Compression=lzma2
 SolidCompression=yes
 PrivilegesRequired=lowest
 DisableProgramGroupPage=yes
-CloseApplications=yes
-CloseApplicationsFilter=gui_app.exe,run_http.exe
+CloseApplications=no
 RestartApplications=no
 UninstallDisplayIcon={app}\gui_app.exe
 SetupIconFile=..\assets\iotbox-icon.ico
@@ -34,3 +33,16 @@ Name: "{userdesktop}\IOTBOX"; Filename: "{app}\gui_app.exe"; IconFilename: "{app
 
 [Run]
 Filename: "{app}\gui_app.exe"; Description: "启动 IOTBOX"; Flags: nowait postinstall skipifsilent
+
+[Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM gui_app.exe', '', SW_HIDE,
+       ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM run_http.exe', '', SW_HIDE,
+       ewWaitUntilTerminated, ResultCode);
+  Sleep(800);
+  Result := '';
+end;

@@ -1,8 +1,8 @@
 {
-  "version": "2026.08.09",
-  "release_date": "2026-08-09",
-  "changelog": "Keep server binding visible with service controls and restart GUI after install",
-  "download_url": "https://github.com/mikokeyu1986-arch/iot_box_comercia/releases/download/v2026.08.09/IOTBOX-SETUP.exe",
-  "checksum": "be54d6881eecd138c7057a7852bbd9941a40f5772a2d18bed66c1a0e2f0343d9",
-  "file_size": 44563933
+  "version": "2026.08.10",
+  "release_date": "2026-08-10",
+  "changelog": "Force-stop old processes before installation and restart GUI after install",
+  "download_url": "https://github.com/mikokeyu1986-arch/iot_box_comercia/releases/download/v2026.08.10/IOTBOX-SETUP.exe",
+  "checksum": "7badc95dcc4d0fc946a51ed3418b1dd9d734121546496ed984a9b954885d3ab7",
+  "file_size": 44561694
 }
