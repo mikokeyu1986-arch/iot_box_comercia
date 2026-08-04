@@ -49,10 +49,9 @@ _logger = logging.getLogger(__name__)
 # ============================================================================
 
 APP_NAME = "IoT Box Desktop"
-_CONFIG_HTTP = BASE_DIR / "runtime_config_http.json"
 _CONFIG_DEFAULT = BASE_DIR / "runtime_config.json"
-# HTTP and HTTPS runtimes can be started independently.
-CONFIG_FILE = _CONFIG_HTTP
+# One configuration source for both HTTP and HTTPS runtimes.
+CONFIG_FILE = _CONFIG_DEFAULT
 
 DEFAULT_SCALE_PORT = "COM3"
 DEFAULT_SCALE_BAUDRATE = 9600
@@ -156,9 +155,6 @@ class SettingsWindow(tk.Toplevel):
         self._build_redsys_tab()
 
         # ---- Tab 2: 服务器配置 ----
-        self.tab_server = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_server, text="  服务器  ")
-        self._build_server_tab()
 
         # ---- Tab 3: 电子秤配置 ----
         self.tab_scale = ttk.Frame(self.notebook)
@@ -196,7 +192,7 @@ class SettingsWindow(tk.Toplevel):
         proto_frame = ttk.LabelFrame(f, text="协议切换", padding=10)
         proto_frame.pack(fill="x", padx=10, pady=10)
 
-        self.proto_var = StringVar(value="http")
+        self.proto_var = StringVar(value="https")
         rb_http = ttk.Radiobutton(proto_frame, text=f"HTTP  (端口 {HTTP_PORT})", variable=self.proto_var, value="http")
         rb_https = ttk.Radiobutton(proto_frame, text=f"HTTPS (端口 {HTTPS_PORT})", variable=self.proto_var, value="https")
         rb_http.pack(side="left", padx=(0, 20))
@@ -222,6 +218,8 @@ class SettingsWindow(tk.Toplevel):
 
         self.btn_open_web = ttk.Button(btn_frame, text="🌐  打开网页界面", command=self._on_open_web)
         self.btn_open_web.pack(side="left")
+        # Keep server binding visible on the same service-control page.
+        self._build_server_tab()
 
         # -- 日志区 --
         log_frame = ttk.LabelFrame(f, text="服务日志", padding=5)
@@ -229,7 +227,7 @@ class SettingsWindow(tk.Toplevel):
 
         self.log_text = ScrolledText(log_frame, height=10, state="disabled", wrap="word",
                                       font=("Consolas", 9), bg="#1e1e1e", fg="#d4d4d4")
-        self.log_text.pack(fill="both", expand=True)
+        self.log_text.pack(fill="both", expand=False, ipady=35)
 
         self._append_log("IoT Box Desktop 已启动")
 
@@ -368,7 +366,7 @@ class SettingsWindow(tk.Toplevel):
         self._append_log(f"服务设置已保存: protocol={protocol}, auto_start={self.auto_start_var.get()}")
 
     def _activate_protocol_config(self, protocol: str) -> None:
-        target = _CONFIG_HTTP if protocol == "http" else _CONFIG_DEFAULT
+        target = _CONFIG_DEFAULT
         if self.config_store.config_path.resolve() == target.resolve():
             return
         previous_connection = self.config_store.get_connection()
@@ -394,12 +392,19 @@ class SettingsWindow(tk.Toplevel):
                 self.after(0, self._append_log, f"端口 {port} 已有服务运行，不重复启动")
                 return
             service_env = os.environ.copy()
-            service_env["IOT_CONFIG_PATH"] = str(_CONFIG_HTTP if proto == "http" else _CONFIG_DEFAULT)
+            service_env["IOT_CONFIG_PATH"] = str(_CONFIG_DEFAULT)
             # European thermal-printer code page with a real Euro symbol.
             service_env["IOT_ESCPOS_ENCODING"] = "cp858"
+            if getattr(sys, "frozen", False):
+                service_exe = Path(sys.executable).parent / "runtime" / ("run_http.exe" if proto == "http" else "run_https.exe")
+                service_command = [str(service_exe)]
+                service_cwd = service_exe.parent
+            else:
+                service_command = [sys.executable, str(script)]
+                service_cwd = BASE_DIR
             self._service_proc = subprocess.Popen(
-                [sys.executable, str(script)],
-                cwd=str(BASE_DIR),
+                service_command,
+                cwd=str(service_cwd),
                 env=service_env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
@@ -700,7 +705,6 @@ class SettingsWindow(tk.Toplevel):
         # 按钮
         btn_frame = ttk.Frame(f)
         btn_frame.pack(fill="x", padx=10, pady=10)
-        ttk.Button(btn_frame, text="🧪  测试连接", command=self._on_test_scale).pack(side="left", padx=(0, 8))
         ttk.Button(btn_frame, text="💾  保存电子秤配置", command=self._on_save_scale).pack(side="left")
 
     # ------------------------------------------------------------------
@@ -856,6 +860,22 @@ class SettingsWindow(tk.Toplevel):
                 scale_inter_command_delay=float(self.scale_inter_command_delay_var.get() or "0.05"),
                 scale_brand=brand_value,
             )
+            local_url = str(self.config_store.get_local_config().get("local_url") or "http://127.0.0.1:8399")
+            request = Request(
+                local_url.rstrip("/") + "/api/scale/save_config",
+                data=json.dumps({
+                    "scale_port": self.scale_port_var.get().strip(),
+                    "scale_baudrate": int(self.scale_baudrate_var.get()),
+                    "scale_timeout": float(self.scale_timeout_var.get() or "1.2"),
+                    "scale_inter_command_delay": float(self.scale_inter_command_delay_var.get() or "0.05"),
+                    "scale_brand": brand_value,
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(request, timeout=3) as response:
+                if response.status >= 400:
+                    raise RuntimeError(f"IOTBOX rejected scale configuration: HTTP {response.status}")
             self._append_log(f"电子秤配置已保存 (port={self.scale_port_var.get()}, brand={brand_value})")
             messagebox.showinfo("成功", "电子秤配置已保存!\n请重启服务使更改生效。")
         except Exception as e:
@@ -907,20 +927,12 @@ class SettingsWindow(tk.Toplevel):
 
         ttk.Label(update_frame, text="更新源 URL:", font=("Segoe UI", 10)).pack(anchor="w")
         self.update_url_var = StringVar(value=DEFAULT_UPDATE_MANIFEST_URL)
-        ttk.Entry(update_frame, textvariable=self.update_url_var, width=60).pack(fill="x", pady=(3, 5))
         ttk.Label(update_frame, text="填写自定义更新清单 URL（JSON）；留空则使用下方 GitHub Releases 模式",
                    foreground="gray").pack(anchor="w")
 
         # GitHub 模式
-        gh_frame = ttk.Frame(update_frame)
-        gh_frame.pack(fill="x", pady=(5, 0))
-        ttk.Label(gh_frame, text="GitHub:", width=10).pack(side="left")
         self.gh_owner_var = StringVar(value="mikokeyu1986-arch")
-        ttk.Entry(gh_frame, textvariable=self.gh_owner_var, width=15).pack(side="left")
-        ttk.Label(gh_frame, text=" / ").pack(side="left")
         self.gh_repo_var = StringVar(value="iot_box_comercia")
-        ttk.Entry(gh_frame, textvariable=self.gh_repo_var, width=15).pack(side="left")
-        ttk.Label(gh_frame, text="  owner/repo", foreground="gray").pack(side="left", padx=5)
 
         self.gh_prerelease_var = BooleanVar(value=False)
         ttk.Checkbutton(update_frame, text="包含预发布版本", variable=self.gh_prerelease_var).pack(anchor="w", pady=(3, 0))
@@ -1159,7 +1171,7 @@ class SettingsWindow(tk.Toplevel):
     def _load_config(self) -> None:
         """从 config_store 加载电子秤设置（与 runtime 读取同一份 local_config）"""
         local = self.config_store.get_local_config()
-        saved_protocol = str(local.get("service_protocol") or "http").strip().lower()
+        saved_protocol = str(local.get("service_protocol") or "https").strip().lower()
         saved_protocol = saved_protocol if saved_protocol in {"http", "https"} else "http"
         self.proto_var.set(saved_protocol)
         self._activate_protocol_config(saved_protocol)
@@ -1227,7 +1239,7 @@ class TrayApplication:
 
         def on_open_web(icon, item):
             local = self.config_store.get_local_config()
-            protocol = str(local.get("service_protocol") or "http").strip().lower()
+            protocol = str(local.get("service_protocol") or "https").strip().lower()
             protocol = protocol if protocol in {"http", "https"} else "http"
             port = HTTP_PORT if protocol == "http" else HTTPS_PORT
             webbrowser.open(f"{protocol}://127.0.0.1:{port}")
@@ -1342,6 +1354,10 @@ def _ensure_windows_startup_entry() -> None:
 
 
 def main() -> None:
+    global _IOTBOX_GUI_MUTEX
+    _IOTBOX_GUI_MUTEX = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\IOTBOX_GUI_SINGLE_INSTANCE") if platform.system() == "Windows" else None
+    if platform.system() == "Windows" and ctypes.windll.kernel32.GetLastError() == 183:
+        return
     """GUI 模式入口"""
     logging.basicConfig(
         level=logging.ERROR,

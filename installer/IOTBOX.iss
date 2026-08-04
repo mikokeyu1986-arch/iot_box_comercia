@@ -1,5 +1,5 @@
 #define AppName "IOTBOX"
-#define AppVersion "2026.08.08"
+#define AppVersion "2026.08.09"
 #define AppPublisher "IOTBOX"
 #define AppExeName "gui_app.exe"
 
@@ -31,3 +31,6 @@ Source: "..\runtime_config.json"; DestDir: "{app}"; Flags: onlyifdoesntexist ign
 [Icons]
 Name: "{group}\IOTBOX"; Filename: "{app}\gui_app.exe"; IconFilename: "{app}\iotbox-icon.ico"
 Name: "{userdesktop}\IOTBOX"; Filename: "{app}\gui_app.exe"; IconFilename: "{app}\iotbox-icon.ico"
+
+[Run]
+Filename: "{app}\gui_app.exe"; Description: "启动 IOTBOX"; Flags: nowait postinstall skipifsilent
