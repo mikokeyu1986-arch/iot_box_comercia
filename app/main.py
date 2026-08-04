@@ -250,10 +250,69 @@ async def startup_tasks() -> None:
             # 绑定主事件循环，让 ScaleMonitor 子线程能线程安全地推送 SSE 事件
             # 注意：不在此处启动 ScaleMonitor —— 按需读取模式，等 POS 打开称重界面时才启动
             scale_service.bind_main_loop(asyncio.get_running_loop())
+            scale_service.ensure_monitor()
         except Exception:
             _logger.exception("Scale service initialization failed; continuing")
     if IOT_ENABLE_CLOUD_BRIDGE:
         app.state.cloud_bridge_task = asyncio.create_task(cloud_bridge.run_forever())
+        app.state.cloud_bridge_watchdog_task = asyncio.create_task(
+            _cloud_bridge_watchdog()
+        )
+
+
+async def _cloud_bridge_watchdog() -> None:
+    """Cloud Bridge 存活监控：如果 run_forever 协程意外退出或长时间 disconnected，
+    自动重建 task，防止 IoT Box 静默失联。
+    """
+    CHECK_INTERVAL = 15  # 每 15 秒检查一次
+    MAX_DISCONNECTED_SECONDS = 120  # 连续断开超过 2 分钟则重建
+    disconnected_since = 0.0
+
+    while True:
+        await asyncio.sleep(CHECK_INTERVAL)
+        task: asyncio.Task | None = getattr(app.state, "cloud_bridge_task", None)
+
+        # 情况 1：task 不存在或已结束
+        if task is None or task.done():
+            exc = task.exception() if task and task.done() and not task.cancelled() else None
+            _logger.error(
+                "Cloud bridge task died unexpectedly%s. Restarting...",
+                f" exception={exc}" if exc else "",
+            )
+            dev_log("cloud_bridge_task_died", exception=str(exc) if exc else "unknown")
+            cloud_bridge._stop_event.clear()
+            app.state.cloud_bridge_task = asyncio.create_task(cloud_bridge.run_forever())
+            disconnected_since = 0.0
+            continue
+
+        # 情况 2：task 在运行但连接断开时间过长
+        if not cloud_bridge.connected:
+            if disconnected_since == 0.0:
+                disconnected_since = asyncio.get_running_loop().time()
+            else:
+                elapsed = asyncio.get_running_loop().time() - disconnected_since
+                if elapsed > MAX_DISCONNECTED_SECONDS:
+                    _logger.error(
+                        "Cloud bridge disconnected for %.1fs (> %ss). Force restarting...",
+                        elapsed,
+                        MAX_DISCONNECTED_SECONDS,
+                    )
+                    dev_log(
+                        "cloud_bridge_disconnected_too_long",
+                        elapsed_seconds=round(elapsed, 1),
+                        max_seconds=MAX_DISCONNECTED_SECONDS,
+                    )
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    cloud_bridge._stop_event.clear()
+                    app.state.cloud_bridge_task = asyncio.create_task(cloud_bridge.run_forever())
+                    disconnected_since = 0.0
+                    continue
+        else:
+            disconnected_since = 0.0
 
 
 @app.on_event("shutdown")
@@ -272,6 +331,14 @@ async def shutdown_tasks() -> None:
         task.cancel()
         try:
             await task
+        except asyncio.CancelledError:
+            pass
+    # 先取消 watchdog，避免它在我们停止 cloud_bridge 时又重建 task
+    watchdog_task = getattr(app.state, "cloud_bridge_watchdog_task", None)
+    if watchdog_task:
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
         except asyncio.CancelledError:
             pass
     cloud_task = getattr(app.state, "cloud_bridge_task", None)
@@ -951,6 +1018,7 @@ async def connect_to_server(request: JsonRpcRequest) -> dict[str, Any]:
     sync = odoo_sync.sync_setup(
         server_url=connection.get("url", ""),
         token=connection.get("token", ""),
+        db_name=connection.get("db_name", ""),
         identifier=IOT_IDENTIFIER,
         ip=IOT_IP,
         version=IOT_VERSION,
@@ -1002,6 +1070,7 @@ async def api_connect(payload: dict[str, Any]) -> dict[str, Any]:
             odoo_sync.sync_setup,
             server_url=connection.get("url", ""),
             token=connection.get("token", ""),
+            db_name=connection.get("db_name", ""),
             identifier=IOT_IDENTIFIER,
             ip=IOT_IP,
             version=IOT_VERSION,
@@ -1303,4 +1372,10 @@ async def api_scale_save_config(payload: dict[str, Any]) -> dict[str, Any]:
     config = config_store.update_local_config(**update_fields)
     # 按需读取模式：保存配置后不自动启动监控
     # 监控会在 POS 打开称重界面（调用 read_once action）时自动启动
-    return {"status": "success", "local_config": config}
+    if scale_service is not None:
+        scale_service.ensure_monitor()
+    return {
+        "status": "success",
+        "local_config": config,
+        "is_monitor_running": scale_service.is_monitor_running if scale_service else False,
+    }

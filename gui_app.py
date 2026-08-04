@@ -27,6 +27,7 @@ import webbrowser
 import ctypes
 import re
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError
 from pathlib import Path
 import tkinter as tk
 from tkinter import Tk, StringVar, IntVar, BooleanVar
@@ -147,9 +148,12 @@ class SettingsWindow(tk.Toplevel):
 
         # ---- Tab 1: 服务控制 ----
         self.tab_service = ttk.Frame(self.notebook)
-        self.tab_server = self.tab_service
+        self.tab_server = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_service, text="  服务控制  ")
         self._build_service_tab()
+
+        self.notebook.add(self.tab_server, text="  Odoo Server Binding  ")
+        self._build_server_tab()
 
         self.tab_redsys = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_redsys, text="  REDSYS 刷卡  ")
@@ -178,7 +182,7 @@ class SettingsWindow(tk.Toplevel):
         toolbar = ttk.Frame(frame)
         toolbar.pack(fill="x", padx=10, pady=10)
         ttk.Button(toolbar, text="刷新日志", command=self._refresh_diagnostics).pack(side="left", padx=(0, 8))
-        ttk.Button(toolbar, text="清空显示", command=lambda: self.diagnostics_text.delete("1.0", "end")).pack(side="left", padx=(0, 8))
+        ttk.Button(toolbar, text="清空显示", command=self._clear_diagnostics).pack(side="left", padx=(0, 8))
         ttk.Button(toolbar, text="导出日志", command=self._export_diagnostics).pack(side="left")
         ttk.Label(frame, text="仅用于开发排错；日志可能包含设备地址等运行信息，请勿直接公开。", foreground="gray").pack(anchor="w", padx=10)
         self.diagnostics_text = ScrolledText(frame, state="disabled", wrap="none", font=("Consolas", 9))
@@ -204,6 +208,11 @@ class SettingsWindow(tk.Toplevel):
         self.diagnostics_text.config(state="normal")
         self.diagnostics_text.delete("1.0", "end")
         self.diagnostics_text.insert("1.0", text)
+        self.diagnostics_text.config(state="disabled")
+
+    def _clear_diagnostics(self) -> None:
+        self.diagnostics_text.config(state="normal")
+        self.diagnostics_text.delete("1.0", "end")
         self.diagnostics_text.config(state="disabled")
 
     def _export_diagnostics(self) -> None:
@@ -261,8 +270,6 @@ class SettingsWindow(tk.Toplevel):
 
         self.btn_open_web = ttk.Button(btn_frame, text="🌐  打开网页界面", command=self._on_open_web)
         self.btn_open_web.pack(side="left")
-        # Keep server binding visible on the same service-control page.
-        self._build_server_tab()
 
         # -- 日志区 --
         log_frame = ttk.LabelFrame(f, text="服务日志", padding=5)
@@ -590,11 +597,14 @@ class SettingsWindow(tk.Toplevel):
         self.token_url_var = StringVar()
         url_entry = ttk.Entry(url_frame, textvariable=self.token_url_var, width=60)
         url_entry.pack(fill="x", pady=(5, 5))
+        url_entry.bind("<Control-v>", lambda event: self._paste_token_url(url_entry))
+        url_entry.bind("<Control-V>", lambda event: self._paste_token_url(url_entry))
         ttk.Label(url_frame, text="格式: http://地址:端口?token=xxx&db_uuid=xxx&enterprise_code=&db_name=xxx",
                   foreground="gray", font=("Segoe UI", 8)).pack(anchor="w")
 
         btn_row = ttk.Frame(url_frame)
         btn_row.pack(fill="x", pady=(10, 0))
+        ttk.Button(btn_row, text="📋 粘贴 Token", command=lambda: self._paste_token_url(url_entry)).pack(side="left", padx=(0, 8))
         self.btn_connect = ttk.Button(btn_row, text="🔗  连接并绑定", command=self._on_connect_server)
         self.btn_connect.pack(side="left", padx=(0, 8))
         ttk.Button(btn_row, text="断开", command=self._on_disconnect_server).pack(side="left")
@@ -616,13 +626,45 @@ class SettingsWindow(tk.Toplevel):
         self.lbl_bound_sync = ttk.Label(self.lbl_bound_detail, text="", font=("Segoe UI", 9))
         self.lbl_bound_sync.pack(anchor="w")
 
+        info_frame = ttk.LabelFrame(f, text="连接信息", padding=12)
+        # Keep connection details directly below the Token area so they are
+        # visible without scrolling past the service log.
+        info_frame.pack(fill="x", padx=10, pady=(0, 10), before=status_frame)
+        self.lbl_connection_server = ttk.Label(info_frame, text="服务器地址: -", font=("Segoe UI", 9))
+        self.lbl_connection_server.pack(anchor="w")
+        self.lbl_connection_db = ttk.Label(info_frame, text="数据库: -", font=("Segoe UI", 9))
+        self.lbl_connection_db.pack(anchor="w", pady=(4, 0))
+        self.lbl_connection_token = ttk.Label(info_frame, text="Token: -", font=("Segoe UI", 9))
+        self.lbl_connection_token.pack(anchor="w", pady=(4, 0))
+
         # 初始加载绑定状态
         self._refresh_bound_status()
+
+    def _paste_token_url(self, entry: ttk.Entry):
+        try:
+            value = self.clipboard_get().strip()
+        except tk.TclError:
+            value = ""
+        if value:
+            self.token_url_var.set(value)
+            entry.icursor("end")
+            entry.focus_set()
+        return "break"
+
+    @staticmethod
+    def _mask_token(token: str) -> str:
+        token = str(token or "")
+        if len(token) <= 8:
+            return "••••••••" if token else "-"
+        return f"{token[:4]}{'•' * max(4, len(token) - 8)}{token[-4:]}"
 
     def _refresh_bound_status(self) -> None:
         """从配置文件读取并显示当前绑定状态"""
         conn = self.config_store.get_connection()
-        if conn.get("connected") and conn.get("url"):
+        self.lbl_connection_server.config(text=f"服务器地址: {conn.get('url', '') or '-'}")
+        self.lbl_connection_db.config(text=f"数据库: {conn.get('db_name', '') or '-'}")
+        self.lbl_connection_token.config(text=f"Token: {self._mask_token(conn.get('token', ''))}")
+        if conn.get("connected") and conn.get("url") and conn.get("iot_channel"):
             self.lbl_bound_status.config(text="✅ 已绑定", foreground="green")
             self.lbl_bound_url.config(text=f"服务器: {conn.get('url', '')}")
             self.lbl_bound_db.config(text=f"数据库: {conn.get('db_name', '')}")
@@ -640,6 +682,11 @@ class SettingsWindow(tk.Toplevel):
                 f"&enterprise_code={conn.get('enterprise_code', '')}"
                 f"&db_name={conn.get('db_name', '')}"
             )
+        elif conn.get("connected") and conn.get("url"):
+            self.lbl_bound_status.config(text="⚠ 本地已保存，Odoo 未登记", foreground="darkorange")
+            self.lbl_bound_url.config(text=f"服务器: {conn.get('url', '')}")
+            self.lbl_bound_db.config(text=f"数据库: {conn.get('db_name', '')}")
+            self.lbl_bound_sync.config(text=f"同步: ❌ {conn.get('last_sync_message', '') or '未返回 Odoo iot_channel'}", foreground="red")
         else:
             self.lbl_bound_status.config(text="⏳ 未绑定", foreground="gray")
             self.lbl_bound_url.config(text="")
@@ -655,16 +702,35 @@ class SettingsWindow(tk.Toplevel):
 
         try:
             self.btn_connect.config(state="disabled", text="连接中…")
+            configured_url = str(self.config_store.get_local_config().get("local_url") or "").rstrip("/")
+            local_urls = [configured_url, "http://127.0.0.1:8399", "https://127.0.0.1:8398"]
+            result = None
+            errors = []
+            for local_url in dict.fromkeys(url for url in local_urls if url):
+                try:
+                    request = Request(
+                        f"{local_url}/api/connect",
+                        data=json.dumps({"token_url": token_url}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    context = ssl._create_unverified_context() if local_url.startswith("https://127.0.0.1") else None
+                    with urlopen(request, timeout=8, context=context) as response:
+                        result = json.loads(response.read().decode("utf-8"))
+                    self._append_log(f"本地 IOTBOX 绑定接口已连接: {local_url}")
+                    break
+                except HTTPError as exc:
+                    try:
+                        detail = exc.read().decode("utf-8", errors="replace")[:1000]
+                    except Exception:
+                        detail = str(exc)
+                    errors.append(f"{local_url}: HTTP {exc.code} {detail}")
+                except Exception as exc:
+                    errors.append(f"{local_url}: {exc}")
+            if result is None:
+                raise ConnectionError("无法连接本地 IOTBOX 绑定接口\n" + "\n".join(errors))
+            # 只有本地 IOTBOX 已确认接收绑定后，才持久化 GUI 的绑定状态。
             self.config_store.connect_from_token_url(token_url)
-            local_url = str(self.config_store.get_local_config().get("local_url") or "http://127.0.0.1:8399").rstrip("/")
-            request = Request(
-                f"{local_url}/api/connect",
-                data=json.dumps({"token_url": token_url}).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urlopen(request, timeout=15) as response:
-                result = json.loads(response.read().decode("utf-8"))
             if result.get("server_connection"):
                 self.config_store.update_connection(**result["server_connection"])
             self._refresh_bound_status()

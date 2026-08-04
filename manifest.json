@@ -1,8 +1,8 @@
 {
-  "version": "2026.08.14",
-  "release_date": "2026-08-14",
-  "changelog": "Do not terminate installer when stopping old GUI process",
-  "download_url": "https://github.com/mikokeyu1986-arch/iot_box_comercia/releases/download/v2026.08.14/IOTBOX-SETUP.exe",
-  "checksum": "6558cf46ca14adb72711ccf3756feb56d8bec5ab21d3c6bc6789e6bcdf9ce416",
-  "file_size": 44583254
+  "version": "2026.08.20",
+  "release_date": "2026-08-20",
+  "changelog": "Move Odoo server binding to a dedicated tab",
+  "download_url": "",
+  "checksum": "a3e1d436acd8fa606789e1a4030054a3ea65584426f97df2fb70aead7f04d0d8",
+  "file_size": 44588778
 }

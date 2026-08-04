@@ -93,6 +93,10 @@ class OdooCloudBridge:
         self._ws_close_timeout = max(1.0, float(os.getenv("IOT_WS_CLOSE_TIMEOUT", "5")))
         self._ws_max_size = max(1024 * 1024, int(os.getenv("IOT_WS_MAX_SIZE", str(16 * 1024 * 1024))))
         self._ws_max_queue = max(16, int(os.getenv("IOT_WS_MAX_QUEUE", "256")))
+        # 保活监控：记录最后一次收到 WebSocket 消息的时间戳
+        # 如果超过 2 倍 ping_interval 无消息，视为连接假死
+        self._ws_last_message_at = 0.0
+        self._ws_receive_timeout = max(30.0, self._ws_ping_interval * 2 + 30)
 
     # ------------------------------------------------------------------
     # Dedicated thread pool helpers
@@ -292,6 +296,7 @@ class OdooCloudBridge:
                 self.connected = True
                 self.last_error = ""
                 self._reconnect_delay_seconds = 1.0
+                self._ws_last_message_at = asyncio.get_running_loop().time()
                 await ws.send(
                     json.dumps(
                         {
@@ -313,49 +318,99 @@ class OdooCloudBridge:
                     session_id=session_id,
                 )
 
-                async for raw in ws:
-                    raw_started_at = asyncio.get_running_loop().time()
-                    messages = self._parse_messages(raw)
-                    raw_size = len(raw) if isinstance(raw, (str, bytes, bytearray)) else 0
-                    _logger.info(
-                        "Cloud bridge websocket message received bytes=%s messages=%s pending_tasks=%s",
-                        raw_size,
-                        len(messages),
-                        len(self._action_tasks),
-                    )
-                    dev_log(
-                        "cloud_bridge_message",
-                        raw_bytes=raw_size,
-                        message_count=len(messages),
-                        pending_tasks=len(self._action_tasks),
-                    )
-                    for message in messages:
-                        msg_id = int(message.get("id") or 0)
-                        if msg_id:
-                            latest_message_id = msg_id
-                            self.config_store.update_last_websocket_message_id(msg_id)
-                        message_type = str(message.get("message", {}).get("type") or "unknown") if isinstance(message.get("message"), dict) else "unknown"
-                        _logger.debug(
-                            "Cloud bridge processing message id=%s type=%s raw_bytes=%s",
-                            msg_id,
-                            message_type,
+                # 保活监控协程：如果超过 receive_timeout 无消息，主动关闭连接触发重连
+                keepalive_task = asyncio.create_task(self._ws_keepalive_watchdog(ws))
+                try:
+                    async for raw in ws:
+                        self._ws_last_message_at = asyncio.get_running_loop().time()
+                        raw_started_at = self._ws_last_message_at
+                        messages = self._parse_messages(raw)
+                        raw_size = len(raw) if isinstance(raw, (str, bytes, bytearray)) else 0
+                        _logger.info(
+                            "Cloud bridge websocket message received bytes=%s messages=%s pending_tasks=%s",
                             raw_size,
-                        )
-                        should_reconnect = await self._handle_message(server_url, message)
-                        if should_reconnect:
-                            raise ReconnectRequested()
-                    duration_ms = (asyncio.get_running_loop().time() - raw_started_at) * 1000
-                    if duration_ms > 1000:
-                        _logger.warning(
-                            "Cloud bridge websocket message handling slow duration_ms=%.1f messages=%s pending_tasks=%s",
-                            duration_ms,
                             len(messages),
                             len(self._action_tasks),
                         )
+                        dev_log(
+                            "cloud_bridge_message",
+                            raw_bytes=raw_size,
+                            message_count=len(messages),
+                            pending_tasks=len(self._action_tasks),
+                        )
+                        for message in messages:
+                            msg_id = int(message.get("id") or 0)
+                            if msg_id:
+                                latest_message_id = msg_id
+                                self.config_store.update_last_websocket_message_id(msg_id)
+                            message_type = str(message.get("message", {}).get("type") or "unknown") if isinstance(message.get("message"), dict) else "unknown"
+                            _logger.debug(
+                                "Cloud bridge processing message id=%s type=%s raw_bytes=%s",
+                                msg_id,
+                                message_type,
+                                raw_size,
+                            )
+                            should_reconnect = await self._handle_message(server_url, message)
+                            if should_reconnect:
+                                raise ReconnectRequested()
+                        duration_ms = (asyncio.get_running_loop().time() - raw_started_at) * 1000
+                        if duration_ms > 1000:
+                            _logger.warning(
+                                "Cloud bridge websocket message handling slow duration_ms=%.1f messages=%s pending_tasks=%s",
+                                duration_ms,
+                                len(messages),
+                                len(self._action_tasks),
+                            )
+                finally:
+                    keepalive_task.cancel()
+                    try:
+                        await keepalive_task
+                    except asyncio.CancelledError:
+                        pass
         finally:
             self._active_ws = None
             self.connected = False
             self.config_store.update_last_websocket_message_id(latest_message_id, force=True)
+
+    async def _ws_keepalive_watchdog(self, ws: Any) -> None:
+        """保活监控：定期检查最后一次收到消息的时间。
+        如果超过 _ws_receive_timeout 秒无消息，认为连接已假死，强制关闭 WebSocket 触发重连。
+        """
+        check_interval = max(10.0, self._ws_ping_interval)
+        try:
+            while True:
+                await asyncio.sleep(check_interval)
+                now = asyncio.get_running_loop().time()
+                elapsed = now - self._ws_last_message_at
+                if elapsed > self._ws_receive_timeout:
+                    _logger.error(
+                        "Cloud bridge keepalive timeout: no message received for %.1fs (limit %.1fs). "
+                        "Force closing websocket to trigger reconnect.",
+                        elapsed,
+                        self._ws_receive_timeout,
+                    )
+                    dev_log(
+                        "cloud_bridge_keepalive_timeout",
+                        idle_seconds=round(elapsed, 1),
+                        limit_seconds=self._ws_receive_timeout,
+                    )
+                    # 强制关闭连接，使 async for 循环退出，触发外层重连逻辑
+                    await ws.close(1001, "keepalive timeout")
+                    return
+                _logger.debug(
+                    "Cloud bridge keepalive check: idle=%.1fs limit=%.1fs ok",
+                    elapsed,
+                    self._ws_receive_timeout,
+                )
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            _logger.exception("Cloud bridge keepalive watchdog unexpected error")
+            # 发生意外错误时也关闭连接
+            try:
+                await ws.close(1011, "keepalive watchdog error")
+            except Exception:
+                pass
 
     async def _handle_message(self, server_url: str, message: dict[str, Any]) -> bool:
         started_at = asyncio.get_running_loop().time()
@@ -770,7 +825,9 @@ class OdooCloudBridge:
             # 使用禁止重定向的 opener：Odoo /web/login 返回 302 时，
             # 默认 urlopen 会跟随 → 可能无限循环。
             # 我们直接从 302 响应的 Set-Cookie 中提取 session_id。
-            with _NO_REDIRECT_OPENER.open(req, timeout=10, context=ssl_context) as resp:
+            # OpenerDirector.open() 不支持 context 参数（urlopen 独有）。
+            # 对于 HTTPS 场景，通过 install_opener + urlopen 组合更可靠。
+            with _NO_REDIRECT_OPENER.open(req, timeout=10) as resp:
                 set_cookies = resp.headers.get_all("Set-Cookie", [])
                 _logger.debug(
                     "Fetched session_id from %s http_status=%s cookies_count=%s verify_ssl=%s",
@@ -816,6 +873,7 @@ class OdooCloudBridge:
         sync = self.odoo_sync.sync_setup(
             server_url=connection.get("url", ""),
             token=connection.get("token", ""),
+            db_name=connection.get("db_name", ""),
             identifier=self.iot_identifier,
             ip=self.iot_ip,
             version=self.iot_version,

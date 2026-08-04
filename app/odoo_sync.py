@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import ssl
 import time
+from urllib.parse import quote
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import URLError
@@ -44,6 +45,7 @@ class OdooSyncService:
         *,
         server_url: str,
         token: str,
+        db_name: str = "",
         identifier: str,
         ip: str,
         version: str,
@@ -53,6 +55,8 @@ class OdooSyncService:
             return SyncResult(False, "Missing server_url or token")
 
         endpoint = f"{server_url.rstrip('/')}/iot/setup"
+        if db_name and "?" not in endpoint:
+            endpoint += f"?db={quote(str(db_name).strip())}"
         payload = {
             "jsonrpc": "2.0",
             "method": "call",
@@ -69,7 +73,10 @@ class OdooSyncService:
             "id": int(time.time()),
         }
         body = json.dumps(payload).encode("utf-8")
-        req = Request(endpoint, data=body, headers={"Content-Type": "application/json"}, method="POST")
+        headers = {"Content-Type": "application/json"}
+        if db_name:
+            headers["X-Odoo-Database"] = str(db_name).strip()
+        req = Request(endpoint, data=body, headers=headers, method="POST")
         ssl_context = None if self.verify_ssl else ssl._create_unverified_context()
         try:
             with urlopen(req, timeout=8, context=ssl_context) as resp:
