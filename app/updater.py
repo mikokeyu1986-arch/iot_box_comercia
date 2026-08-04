@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -17,6 +18,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import tempfile
 import zipfile
 from pathlib import Path
@@ -33,7 +35,7 @@ _logger = logging.getLogger(__name__)
 
 DEFAULT_UPDATE_MANIFEST_URL = os.getenv(
     "IOT_UPDATE_MANIFEST_URL",
-    "https://raw.githubusercontent.com/mikokeyu1986-arch/iot_box_comercia/master/manifest.json",
+    "https://api.github.com/repos/mikokeyu1986-arch/iot_box_comercia/contents/manifest.json?ref=master",
 )
 
 # ---------------------------------------------------------------------------
@@ -127,6 +129,9 @@ class UpdateSource:
         try:
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
+            if isinstance(data, dict) and data.get("encoding") == "base64" and data.get("content"):
+                content = base64.b64decode(data["content"].replace("\n", "")).decode("utf-8")
+                data = json.loads(content)
             if not isinstance(data, dict):
                 raise ValueError("更新清单格式无效")
             return data
@@ -318,6 +323,8 @@ class UpdateManager:
             ext = ".zip"
         elif url_path.lower().endswith(".7z"):
             ext = ".7z"
+        elif url_path.lower().endswith(".exe"):
+            ext = ".exe"
         else:
             ext = ".zip"
 
@@ -371,6 +378,20 @@ class UpdateManager:
         4. 清理临时文件
         """
         extract_dir: Path | None = None
+        if package_path.suffix.lower() == ".exe":
+            backup_path = self._create_backup()
+            subprocess.Popen(
+                [str(package_path), "/SILENT", "/CLOSEAPPLICATIONS", "/RESTARTAPPLICATIONS"],
+                cwd=str(package_path.parent),
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return UpdateResult(
+                success=True,
+                message=f"安装包已启动: {version}，现场配置将被保留。",
+                current_version=self.current_version,
+                latest_version=version,
+                details={"backup_path": str(backup_path), "installer": str(package_path)},
+            )
         try:
             # 1. 备份
             backup_path = self._create_backup()
@@ -489,7 +510,6 @@ class UpdateManager:
         # 不覆盖的文件（运行时配置等）
         do_not_overwrite = {
             "runtime_config.json",
-            "runtime_config_http.json",
         }
 
         for src in source_dir.rglob("*"):

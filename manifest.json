@@ -1,8 +1,8 @@
 {
-  "version": "2026.08.05",
-  "release_date": "2026-08-05",
-  "changelog": "Installer update with preserved runtime configuration",
-  "download_url": "https://github.com/mikokeyu1986-arch/iot_box_comercia/releases/download/v2026.08.05/IOTBOX-SETUP.exe",
-  "checksum": "14592e231362808caf486415ec1ff5439ea925da4e1d7744fcf7636978f7aba8",
-  "file_size": 44288893
+  "version": "2026.08.06",
+  "release_date": "2026-08-06",
+  "changelog": "Fix GitHub update manifest cache and installer update detection",
+  "download_url": "https://github.com/mikokeyu1986-arch/iot_box_comercia/releases/download/v2026.08.06/IOTBOX-SETUP.exe",
+  "checksum": "188cf5d03e7254fbc17f7d14ab9f1de25ca3c7d929033283d3286b985fce8f2e",
+  "file_size": 44291503
 }
