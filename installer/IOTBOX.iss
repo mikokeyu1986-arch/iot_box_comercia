@@ -1,5 +1,5 @@
 #define AppName "IOTBOX"
-#define AppVersion "2026.08.10"
+#define AppVersion "2026.08.11"
 #define AppPublisher "IOTBOX"
 #define AppExeName "gui_app.exe"
 

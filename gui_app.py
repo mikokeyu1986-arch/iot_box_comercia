@@ -147,6 +147,7 @@ class SettingsWindow(tk.Toplevel):
 
         # ---- Tab 1: 服务控制 ----
         self.tab_service = ttk.Frame(self.notebook)
+        self.tab_server = self.tab_service
         self.notebook.add(self.tab_service, text="  服务控制  ")
         self._build_service_tab()
 
