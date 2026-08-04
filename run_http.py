@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import logging
 import os
+import ctypes
 from pathlib import Path
 from urllib.parse import urlparse
 
 BASE_DIR = Path(__file__).resolve().parent
 _DEFAULT_HTTP_PORT = os.getenv("IOT_HTTP_PORT", os.getenv("IOT_PORT", "8399"))
-os.environ.setdefault("IOT_CONFIG_PATH", str(BASE_DIR / "runtime_config_http.json"))
+os.environ.setdefault("IOT_CONFIG_PATH", str(BASE_DIR / "runtime_config.json"))
 os.environ.setdefault("IOT_IP", f"127.0.0.1:{_DEFAULT_HTTP_PORT}")
 
 LOG_DIR = BASE_DIR / "logs"
@@ -68,6 +69,10 @@ def _coerce_http_runtime_config(port: int) -> None:
 
 
 def main() -> None:
+    mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\IOTBOX_HTTP_SINGLE_INSTANCE") if os.name == "nt" else None
+    if os.name == "nt" and ctypes.windll.kernel32.GetLastError() == 183:
+        logging.getLogger(__name__).warning("IOTBOX HTTP service already running; refusing duplicate instance")
+        return
     _configure_windows_asyncio()
     _clear_spool_history()
     host, port = _resolve_host_port()

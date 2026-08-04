@@ -654,13 +654,6 @@ class ScaleMonitor:
         while not self._stop_event.is_set():
             # 按需读取模式：超过 ON_DEMAND_TIMEOUT_SECONDS 没有新的 read_once action，
             # 自动停止监控（POS 已关闭称重界面）
-            if self._scale_service._last_action_at > 0:
-                idle = time.monotonic() - self._scale_service._last_action_at
-                if idle > ScaleService.ON_DEMAND_TIMEOUT_SECONDS:
-                    _logger.info("Scale on-demand monitor stopping (idle %.1fs, POS closed scale screen)", idle)
-                    self._stop_event.set()
-                    return
-
             # 优先被动读取：电子秤（如 Gram ZFOC / Epelsa）持续发送实时重量数据。
             # 不 flush_input，避免丢弃电子秤发送的实时数据。
             chunk = self._read_chunk(port)

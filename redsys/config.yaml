@@ -1,5 +1,5 @@
 app:
-  simulate: false
+  simulate: 'false'
   log:
     level: 'INFO'
   http:

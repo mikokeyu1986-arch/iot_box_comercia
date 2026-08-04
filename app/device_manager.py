@@ -211,7 +211,7 @@ class DeviceManager(
             self._printer_action_queues[device_identifier] = queue
         task = self._printer_action_tasks.get(device_identifier)
         if task is None or task.done():
-            task = asyncio.create_task(self._printer_action_worker(device_identifier, queue))
+            task = asyncio.create_task(self._printer_action_worker_loop(device_identifier, queue))
             self._printer_action_tasks[device_identifier] = task
             _logger.info(
                 "Printer action worker started device=%s max_queue_size=%s",
@@ -225,6 +225,7 @@ class DeviceManager(
         device_identifier: str,
         queue: asyncio.Queue[dict[str, Any]],
     ) -> None:
+        """Printer action worker 循环体。异常退出后由 _printer_action_worker_loop 自动重建。"""
         while True:
             job = await queue.get()
             owner = str(job.get("owner") or "")
@@ -311,6 +312,38 @@ class DeviceManager(
                     future.set_result(True)
             finally:
                 queue.task_done()
+
+    async def _printer_action_worker_loop(
+        self,
+        device_identifier: str,
+        queue: asyncio.Queue[dict[str, Any]],
+    ) -> None:
+        """Printer action worker 外层循环：worker 异常退出时自动重建。
+        防止 queue.get() 抛出非 CancelledError 异常导致 worker 静默死亡。
+        """
+        while True:
+            try:
+                await self._printer_action_worker(device_identifier, queue)
+            except asyncio.CancelledError:
+                _logger.info(
+                    "Printer action worker cancelled device=%s remaining_queue=%s",
+                    device_identifier,
+                    queue.qsize(),
+                )
+                break
+            except Exception:
+                _logger.exception(
+                    "Printer action worker died unexpectedly device=%s remaining_queue=%s. "
+                    "Restarting in 2 seconds...",
+                    device_identifier,
+                    queue.qsize(),
+                )
+                dev_log(
+                    "printer_action_worker_died",
+                    device_identifier=device_identifier,
+                    remaining_queue=queue.qsize(),
+                )
+                await asyncio.sleep(2)
 
     async def execute(self, owner: str, device_identifier: str, data: dict[str, Any]) -> bool:
         requested_device_identifier = device_identifier

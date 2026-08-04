@@ -25,3 +25,8 @@ kitchen_template.json
 *.json.bak
 *.json.tmp
 *.json.invalid
+*.qmlc
+*.jsc
+# PowerShell 意外生成的空文件
+
+*.broken

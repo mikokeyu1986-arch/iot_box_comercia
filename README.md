@@ -30,8 +30,7 @@ HTTP run example:
 python run_http.py
 ```
 
-The HTTP service defaults to `http://127.0.0.1:8399` and uses its own `runtime_config_http.json`.
-The main `runtime_config.json` is reserved for HTTPS on `https://127.0.0.1:8398`.
+The HTTP and HTTPS services share the single `runtime_config.json` configuration file.
 
 Detailed developer diagnostics are written to `logs/dev_debug.log`.
 
