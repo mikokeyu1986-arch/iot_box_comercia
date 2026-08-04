@@ -1,8 +1,8 @@
 {
-  "version": "2026.08.12",
-  "release_date": "2026-08-12",
-  "changelog": "Add diagnostics log viewer and export",
-  "download_url": "https://github.com/mikokeyu1986-arch/iot_box_comercia/releases/download/v2026.08.12/IOTBOX-SETUP.exe",
-  "checksum": "60397aa52fbe8e31fd407ac14f17b0cd28ceced2dae01a0234dd7f0dea8a5375",
-  "file_size": 44584299
+  "version": "2026.08.13",
+  "release_date": "2026-08-13",
+  "changelog": "Synchronize displayed application version with installer version",
+  "download_url": "https://github.com/mikokeyu1986-arch/iot_box_comercia/releases/download/v2026.08.13/IOTBOX-SETUP.exe",
+  "checksum": "68a2b88bfb1da252c301a12a96688ba18f2184b4ca9c7448ee860c8720682c53",
+  "file_size": 44584980
 }
