@@ -11,8 +11,8 @@
     "iot_channel": ""
   },
   "local_config": {
-    "ssl_engine": "plain_http",
-    "local_url": "",
+    "ssl_engine": "secure_https",
+    "local_url": "https://127.0.0.1:8398",
     "iot_identifier": "custom-iot-box-a9f549a11170",
     "printer_identifier": "printer_main",
     "primary_printer_queue": "RP-12N",
@@ -22,7 +22,6 @@
     "scale_timeout": 1.2,
     "scale_inter_command_delay": 0.05,
     "scale_brand": "zfoc",
-    "redsys_enabled": false,
     "redsys_merchant_code": "",
     "redsys_merchant_terminal": "1",
     "redsys_signature_key": "",
@@ -30,6 +29,8 @@
     "redsys_tpv_version": "6.1",
     "redsys_timeout": 120,
     "card_reader_port": "",
-    "card_reader_baudrate": 9600
+    "card_reader_baudrate": 9600,
+    "service_protocol": "http",
+    "auto_start_service": true
   }
 }

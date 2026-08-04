@@ -15,33 +15,32 @@ from __future__ import annotations
 
 import logging
 import json
-import re
 import os
 import platform
 import subprocess
 import socket
+import ssl
 import sys
 import threading
 import time
 import webbrowser
 import ctypes
+import re
 from urllib.request import Request, urlopen
 from pathlib import Path
 import tkinter as tk
-from tkinter import Tk, Frame, Label, Button, Entry, StringVar, IntVar, BooleanVar
-from tkinter import ttk, messagebox, filedialog
+from tkinter import Tk, StringVar, IntVar, BooleanVar
+from tkinter import ttk, messagebox
 from tkinter.scrolledtext import ScrolledText
 from typing import Any
 
 # 将项目根目录加入 path
 BASE_DIR = Path(__file__).resolve().parent
-REDSYS_DIR = BASE_DIR / "redsys"
-REDSYS_SCRIPT = REDSYS_DIR / "server" / "main.py"
-REDSYS_CONFIG = REDSYS_DIR / "config.yaml"
 sys.path.insert(0, str(BASE_DIR))
 
 from app.config_store import ConfigStore
 from app.updater import UpdateManager, UpdateSource, GitHubUpdateSource, DEFAULT_UPDATE_MANIFEST_URL
+from app.version import APP_VERSION
 
 _logger = logging.getLogger(__name__)
 
@@ -50,13 +49,11 @@ _logger = logging.getLogger(__name__)
 # ============================================================================
 
 APP_NAME = "IoT Box Desktop"
-APP_VERSION = "2026.08.02"
 _CONFIG_HTTP = BASE_DIR / "runtime_config_http.json"
 _CONFIG_DEFAULT = BASE_DIR / "runtime_config.json"
-CONFIG_FILE = _CONFIG_HTTP if _CONFIG_HTTP.exists() else _CONFIG_DEFAULT
+# HTTP and HTTPS runtimes can be started independently.
+CONFIG_FILE = _CONFIG_HTTP
 
-DEFAULT_ODOO_URL = "http://192.168.1.1:8069"
-DEFAULT_TOKEN_URL = "http://192.168.1.1:8069"
 DEFAULT_SCALE_PORT = "COM3"
 DEFAULT_SCALE_BAUDRATE = 9600
 
@@ -85,6 +82,9 @@ SCALE_PRESETS: dict[str, dict[str, Any]] = {
 # 服务控制脚本
 HTTP_SCRIPT = BASE_DIR / "run_http.py"
 HTTPS_SCRIPT = BASE_DIR / "run_https.py"
+REDSYS_SCRIPT = BASE_DIR / "redsys" / "server" / "main.py"
+REDSYS_CONFIG = BASE_DIR / "redsys" / "config.yaml"
+REDSYS_PORT = 6971
 
 
 # ============================================================================
@@ -151,6 +151,10 @@ class SettingsWindow(tk.Toplevel):
         self.notebook.add(self.tab_service, text="  服务控制  ")
         self._build_service_tab()
 
+        self.tab_redsys = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_redsys, text="  REDSYS 刷卡  ")
+        self._build_redsys_tab()
+
         # ---- Tab 2: 服务器配置 ----
         self.tab_server = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_server, text="  服务器  ")
@@ -163,10 +167,6 @@ class SettingsWindow(tk.Toplevel):
         self.tab_customer_display = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_customer_display, text="  Pantalla del cliente  ")
         self._build_customer_display_tab()
-        self.tab_redsys = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_redsys, text="  Redsys  ")
-        self._build_redsys_tab()
-
         # ---- Tab 4: 关于 & 更新 ----
         self.tab_about = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_about, text="  关于 & 更新  ")
@@ -196,7 +196,7 @@ class SettingsWindow(tk.Toplevel):
         proto_frame = ttk.LabelFrame(f, text="协议切换", padding=10)
         proto_frame.pack(fill="x", padx=10, pady=10)
 
-        self.proto_var = StringVar(value="https")
+        self.proto_var = StringVar(value="http")
         rb_http = ttk.Radiobutton(proto_frame, text=f"HTTP  (端口 {HTTP_PORT})", variable=self.proto_var, value="http")
         rb_https = ttk.Radiobutton(proto_frame, text=f"HTTPS (端口 {HTTPS_PORT})", variable=self.proto_var, value="https")
         rb_http.pack(side="left", padx=(0, 20))
@@ -235,82 +235,166 @@ class SettingsWindow(tk.Toplevel):
 
     # ------------------------------------------------------------------
 
+    def _build_redsys_tab(self) -> None:
+        frame = self.tab_redsys
+        settings = ttk.LabelFrame(frame, text="REDSYS 服务配置", padding=12)
+        settings.pack(fill="x", padx=10, pady=10)
+        self.redsys_merchant_var = StringVar()
+        self.redsys_terminal_var = StringVar()
+        self.redsys_com_var = StringVar()
+        self.redsys_password_var = StringVar()
+        self.redsys_version_var = StringVar()
+        self.redsys_simulate_var = BooleanVar(value=False)
+        for row, (label, variable) in enumerate((
+            ("商户号", self.redsys_merchant_var),
+            ("终端号", self.redsys_terminal_var),
+            ("刷卡串口", self.redsys_com_var),
+            ("签名密码", self.redsys_password_var),
+            ("版本号", self.redsys_version_var),
+        )):
+            ttk.Label(settings, text=label).grid(row=row, column=0, sticky="w", pady=4)
+            ttk.Entry(settings, textvariable=variable, width=34).grid(row=row, column=1, sticky="ew", pady=4)
+        ttk.Checkbutton(settings, text="模拟模式（不连接真实刷卡机）", variable=self.redsys_simulate_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=6)
+        settings.columnconfigure(1, weight=1)
+        self.redsys_status_var = StringVar(value="状态：未运行")
+        ttk.Label(frame, textvariable=self.redsys_status_var, font=("Segoe UI", 11)).pack(anchor="w", padx=12)
+        buttons = ttk.Frame(frame)
+        buttons.pack(fill="x", padx=10, pady=10)
+        ttk.Button(buttons, text="保存配置", command=self._save_redsys_config).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="启动 REDSYS", command=self._start_redsys_from_gui).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="停止 REDSYS", command=self._stop_redsys_from_gui).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="打开刷卡界面", command=lambda: webbrowser.open("http://127.0.0.1:6971/ui")).pack(side="left")
+        self._load_redsys_config()
+
+    def _load_redsys_config(self) -> None:
+        text = REDSYS_CONFIG.read_text(encoding="utf-8") if REDSYS_CONFIG.exists() else ""
+        def value(key: str) -> str:
+            match = re.search(rf"^\s*{re.escape(key)}:\s*['\"]?([^'\"\r\n]+)", text, re.MULTILINE)
+            return match.group(1).strip() if match else ""
+        self.redsys_merchant_var.set(value("comercio"))
+        self.redsys_terminal_var.set(value("terminal") or "1")
+        self.redsys_com_var.set(value("puerto"))
+        self.redsys_password_var.set(value("clave_firma"))
+        self.redsys_version_var.set(value("version") or "6.1")
+        self.redsys_simulate_var.set(value("simulate").lower() == "true")
+
+    def _save_redsys_config(self) -> None:
+        if not REDSYS_CONFIG.exists():
+            self.redsys_status_var.set("状态：找不到 REDSYS 配置文件")
+            return
+        text = REDSYS_CONFIG.read_text(encoding="utf-8")
+        for key, new_value in {
+            "comercio": self.redsys_merchant_var.get().strip(),
+            "terminal": self.redsys_terminal_var.get().strip() or "1",
+            "puerto": self.redsys_com_var.get().strip(),
+            "clave_firma": self.redsys_password_var.get().strip(),
+            "version": self.redsys_version_var.get().strip() or "6.1",
+            "simulate": "true" if self.redsys_simulate_var.get() else "false",
+        }.items():
+            text = re.sub(rf"^(\s*{re.escape(key)}:\s*)[^\r\n]+", rf"\g<1>'{new_value}'", text, flags=re.MULTILINE)
+        REDSYS_CONFIG.write_text(text, encoding="utf-8")
+        self.redsys_status_var.set("状态：配置已保存")
+
+    def _start_redsys_from_gui(self) -> None:
+        self._save_redsys_config()
+        self._ensure_redsys_service()
+        self.redsys_status_var.set("状态：运行中" if self._is_local_port_open(REDSYS_PORT) else "状态：启动失败")
+
+    def _stop_redsys_from_gui(self) -> None:
+        proc = getattr(self, "_redsys_proc", None)
+        if proc and proc.poll() is None:
+            proc.terminate()
+        self._redsys_proc = None
+        self.redsys_status_var.set("状态：已停止")
+
     def _on_start(self) -> None:
+        self._ensure_redsys_service()
         proto = self.proto_var.get()
+        self._activate_protocol_config(proto)
         port = HTTPS_PORT if proto == "https" else HTTP_PORT
-        if self._is_local_port_open(port):
+        if self._is_local_service_ready(proto, port):
             # A service started outside this GUI is still a valid running service.
             self._on_service_started(proto)
+            return
+        if self._is_local_port_open(port):
+            self._append_log(f"端口 {port} 已被其他或未就绪的服务占用")
+            return
         self._append_log(f"正在以 {proto.upper()} 模式启动服务…")
         script = HTTP_SCRIPT if proto == "http" else HTTPS_SCRIPT
         threading.Thread(target=self._run_service, args=(script, proto), daemon=True).start()
-        threading.Thread(target=self._run_redsys_service, daemon=True).start()
 
-    def _run_redsys_service(self) -> None:
-        if not self.redsys_enabled_var.get():
-            self.after(0, self._append_log, "Redsys 服务已禁用")
+    def _ensure_redsys_service(self) -> None:
+        """Keep the local Redsys card service available with the IoT Box."""
+        if self._is_local_port_open(REDSYS_PORT):
             return
         if not REDSYS_SCRIPT.exists() or not REDSYS_CONFIG.exists():
-            self.after(0, self._append_log, "Redsys 服务未找到，已跳过启动")
-            return
-        if getattr(self, "_redsys_proc", None) and self._redsys_proc.poll() is None:
-            return
-        if self._is_local_port_open(6971):
-            self.after(0, self._append_log, "Redsys 6971 已有服务运行，不重复启动")
+            self._append_log("REDSYS 启动失败: 找不到 redsys/server/main.py 或 config.yaml")
             return
         try:
+            redsys_env = os.environ.copy()
             self._redsys_proc = subprocess.Popen(
                 [sys.executable, str(REDSYS_SCRIPT), "--config", str(REDSYS_CONFIG)],
-                cwd=str(REDSYS_DIR),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW,
+                cwd=str(BASE_DIR),
+                env=redsys_env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0,
             )
-            self.redsys_status_var.set("Redsys 服务运行中: 127.0.0.1:6971")
-            self.after(0, self._append_log, "Redsys 服务已启动: http://127.0.0.1:6971")
-            # 服务启动后自动执行一次真实刷卡机连接，不需要用户再按按钮。
-            threading.Thread(target=self._check_redsys_status, daemon=True).start()
-            for line in self._redsys_proc.stdout:
-                self.after(0, self._append_log, f"[Redsys] {line.strip()}")
+            deadline = time.time() + 8.0
+            while time.time() < deadline and self._redsys_proc.poll() is None:
+                if self._is_local_port_open(REDSYS_PORT):
+                    self._append_log("REDSYS 刷卡服务已启动: http://127.0.0.1:6971")
+                    return
+                time.sleep(0.2)
+            self._append_log("REDSYS 启动失败: 6971 端口未就绪")
         except Exception as exc:
-            self.after(0, self._append_log, f"Redsys 启动失败: {exc}")
-
-    def _check_redsys_status(self) -> None:
-        try:
-            with urlopen("http://127.0.0.1:6971/health", timeout=5) as response:
-                health = json.loads(response.read().decode("utf-8"))
-            if health.get("simulate"):
-                self.after(0, self.redsys_status_var.set, "Redsys 服务已启动（模拟模式）")
-                return
-            with urlopen("http://127.0.0.1:6971/connect", timeout=130) as response:
-                result = json.loads(response.read().decode("utf-8"))
-            connected = bool(result.get("connected"))
-            message = str(result.get("message") or result.get("error") or "")
-            status = "Redsys 刷卡机已连接" if connected else f"Redsys 刷卡机连接失败: {message}"
-            self.after(0, self.redsys_status_var.set, status)
-            self.after(0, self._append_log, status)
-        except Exception as exc:
-            self.after(0, self.redsys_status_var.set, f"Redsys 服务连接失败: {exc}")
+            self._append_log(f"REDSYS 启动失败: {exc}")
 
     def _save_service_preferences(self) -> None:
         protocol = self.proto_var.get().strip().lower()
         if protocol not in {"http", "https"}:
-            protocol = "https"
-        self.config_store.update_local_config(
-            service_protocol=protocol,
-            auto_start_service=bool(self.auto_start_var.get()),
-        )
+            protocol = "http"
+        self._activate_protocol_config(protocol)
+        preferences = {
+            "service_protocol": protocol,
+            "auto_start_service": bool(self.auto_start_var.get()),
+        }
+        self.config_store.update_local_config(**preferences)
+        if self.config_store.config_path.resolve() != _CONFIG_DEFAULT.resolve():
+            # The default store is also the GUI bootstrap store.  Keep only
+            # launcher preferences there so the next run can reopen the
+            # selected protocol without mixing the two runtime stores.
+            ConfigStore(_CONFIG_DEFAULT).update_local_config(**preferences)
         self._append_log(f"服务设置已保存: protocol={protocol}, auto_start={self.auto_start_var.get()}")
+
+    def _activate_protocol_config(self, protocol: str) -> None:
+        target = _CONFIG_HTTP if protocol == "http" else _CONFIG_DEFAULT
+        if self.config_store.config_path.resolve() == target.resolve():
+            return
+        previous_connection = self.config_store.get_connection()
+        previous_local = self.config_store.get_local_config()
+        target_existed = target.exists()
+        next_store = ConfigStore(target)
+        if not target_existed:
+            portable_local = {
+                key: value
+                for key, value in previous_local.items()
+                if key not in {"ssl_engine", "local_url", "service_protocol"}
+            }
+            if portable_local:
+                next_store.update_local_config(**portable_local)
+            if previous_connection.get("url"):
+                next_store.update_connection(**previous_connection)
+        self.config_store = next_store
 
     def _run_service(self, script: Path, proto: str) -> None:
         try:
             port = HTTPS_PORT if proto == "https" else HTTP_PORT
-            if self._is_local_port_open(port):
+            if self._is_local_service_ready(proto, port):
                 self.after(0, self._append_log, f"端口 {port} 已有服务运行，不重复启动")
                 return
             service_env = os.environ.copy()
-            service_env["IOT_CONFIG_PATH"] = str(CONFIG_FILE)
+            service_env["IOT_CONFIG_PATH"] = str(_CONFIG_HTTP if proto == "http" else _CONFIG_DEFAULT)
             # European thermal-printer code page with a real Euro symbol.
             service_env["IOT_ESCPOS_ENCODING"] = "cp858"
             self._service_proc = subprocess.Popen(
@@ -322,7 +406,22 @@ class SettingsWindow(tk.Toplevel):
                 text=True,
                 creationflags=subprocess.CREATE_NO_WINDOW if platform.system() == "Windows" else 0,
             )
-            self.after(0, self._on_service_started, proto)
+            deadline = time.time() + 20.0
+            while time.time() < deadline and self._service_proc.poll() is None:
+                if self._is_local_service_ready(proto, port):
+                    self.after(0, self._on_service_started, proto)
+                    break
+                time.sleep(0.2)
+            else:
+                return_code = self._service_proc.poll()
+                self.after(
+                    0,
+                    self._append_log,
+                    f"启动失败: 健康检查未通过 (protocol={proto}, port={port}, exit={return_code})",
+                )
+                if self._service_proc.poll() is None:
+                    self._service_proc.terminate()
+                return
             for line in self._service_proc.stdout:
                 self.after(0, self._append_log, line.strip())
         except Exception as e:
@@ -336,6 +435,17 @@ class SettingsWindow(tk.Toplevel):
         except OSError:
             return False
 
+    @staticmethod
+    def _is_local_service_ready(proto: str, port: int) -> bool:
+        url = f"{proto}://127.0.0.1:{int(port)}/healthz"
+        context = ssl._create_unverified_context() if proto == "https" else None
+        try:
+            with urlopen(url, timeout=0.8, context=context) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except (OSError, ValueError):
+            return False
+        return payload.get("status") == "ready" and payload.get("protocol") == proto
+
     def _on_service_started(self, proto: str) -> None:
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
@@ -344,17 +454,6 @@ class SettingsWindow(tk.Toplevel):
         self.lbl_protocol.config(text=f"协议: {proto.upper()}")
         self._start_time = time.time()
         self._update_uptime()
-
-    def _stop_redsys_process(self) -> None:
-        redsys_proc = getattr(self, "_redsys_proc", None)
-        if not redsys_proc:
-            return
-        redsys_proc.terminate()
-        try:
-            redsys_proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            redsys_proc.kill()
-        self._redsys_proc = None
 
     def _stop_service_process(self) -> None:
         """停止服务子进程并等待退出（线程安全，不操作 GUI widget）。
@@ -374,7 +473,6 @@ class SettingsWindow(tk.Toplevel):
             except subprocess.TimeoutExpired:
                 pass
         self._service_proc = None
-        self._stop_redsys_process()
 
     def _update_service_stopped_ui(self) -> None:
         """更新 GUI 显示服务已停止（仅主线程调用）"""
@@ -386,6 +484,10 @@ class SettingsWindow(tk.Toplevel):
 
     def _on_stop(self) -> None:
         self._stop_service_process()
+        redsys_proc = getattr(self, "_redsys_proc", None)
+        if redsys_proc and redsys_proc.poll() is None:
+            redsys_proc.terminate()
+        self._redsys_proc = None
         self._update_service_stopped_ui()
         self._append_log("服务已停止")
 
@@ -595,18 +697,6 @@ class SettingsWindow(tk.Toplevel):
         ttk.Entry(row4, textvariable=self.scale_inter_command_delay_var, width=20).pack(side="left")
         ttk.Label(row4, text="主动探测之间的最小间隔", foreground="gray").pack(side="left", padx=5)
 
-        # 实时推送选项
-        opt_frame = ttk.LabelFrame(f, text="推送选项", padding=10)
-        opt_frame.pack(fill="x", padx=10, pady=10)
-        # Legacy SSE controls are kept internally but hidden from the GUI.
-
-        self.scale_sse_var = BooleanVar(value=False)
-        ttk.Checkbutton(opt_frame, text="启用 SSE 实时推送（本地 Web UI 显示秤盘跳动；POS 不需要）",
-                        variable=self.scale_sse_var).pack(anchor="w")
-        ttk.Label(opt_frame, text="POS 通过 EventBus 接收重量，无需开启 SSE。仅在本地 Web UI 需要实时显示时开启。",
-                  foreground="gray", font=("Segoe UI", 8)).pack(anchor="w")
-        opt_frame.pack_forget()
-
         # 按钮
         btn_frame = ttk.Frame(f)
         btn_frame.pack(fill="x", padx=10, pady=10)
@@ -654,10 +744,20 @@ class SettingsWindow(tk.Toplevel):
         self._close_customer_display_screen()
         url = self.customer_display_url_var.get().strip()
         try:
+            from ctypes import wintypes
+
             monitors = []
-            callback = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_long * 4), ctypes.c_double)
+            callback = ctypes.WINFUNCTYPE(
+                wintypes.BOOL,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+                ctypes.POINTER(wintypes.RECT),
+                wintypes.LPARAM,
+            )
+
             def enum_proc(_monitor, _dc, rect, _data):
-                monitors.append(tuple(rect.contents))
+                bounds = rect.contents
+                monitors.append((bounds.left, bounds.top, bounds.right, bounds.bottom))
                 return True
             ctypes.windll.user32.EnumDisplayMonitors(None, None, callback(enum_proc), 0)
             if len(monitors) < 2:
@@ -682,20 +782,6 @@ class SettingsWindow(tk.Toplevel):
         if process is not None and process.poll() is None:
             process.terminate()
         self.customer_display_proc = None
-        window = getattr(self, "customer_display_webview", None)
-        if window is not None:
-            try:
-                window.destroy()
-            except Exception:
-                pass
-            self.customer_display_webview = None
-        window = getattr(self, "customer_display_window", None)
-        if window is not None:
-            try:
-                window.destroy()
-            except tk.TclError:
-                pass
-            self.customer_display_window = None
 
     def _stop_all_customer_display_processes(self) -> None:
         """清理可能由旧版 GUI 留下的重复客户屏进程。"""
@@ -713,174 +799,6 @@ class SettingsWindow(tk.Toplevel):
             )
         except Exception:
             pass
-
-    def _run_customer_display_webview(self, url: str, left: int, top: int, width: int, height: int) -> None:
-        try:
-            import webview
-            self.customer_display_webview = webview.create_window(
-                "Pantalla del cliente",
-                url=url,
-                x=left,
-                y=top,
-                width=width,
-                height=height,
-                fullscreen=True,
-                resizable=False,
-            )
-            webview.start(gui="edgechromium", debug=False)
-        except Exception as exc:
-            self.after(0, self.customer_display_status_var.set, f"客户屏幕启动失败: {exc}")
-
-    def _build_redsys_tab(self) -> None:
-        frame = self.tab_redsys
-        self.redsys_enabled_var = BooleanVar(
-            value=bool(self.config_store.get_local_config().get("redsys_enabled", True))
-        )
-        self.redsys_simulate_var = BooleanVar(value=False)
-        self.redsys_port_var = StringVar(value="6971")
-        self.redsys_merchant_var = StringVar(value="")
-        self.redsys_terminal_var = StringVar(value="1")
-        self.redsys_key_var = StringVar(value="")
-        self.redsys_serial_var = StringVar(value="COM9")
-        self.redsys_version_var = StringVar(value="6.1")
-        self.redsys_status_var = StringVar(value="Redsys 服务未启动")
-
-        self._load_redsys_config_values()
-
-        ttk.Checkbutton(frame, text="启用 Redsys 服务", variable=self.redsys_enabled_var,
-                        command=self._save_redsys_config).pack(anchor="w", padx=12, pady=10)
-        form = ttk.LabelFrame(frame, text="Redsys 配置", padding=10)
-        form.pack(fill="x", padx=12, pady=5)
-        fields = [
-            ("服务端口", self.redsys_port_var),
-            ("商户号", self.redsys_merchant_var),
-            ("终端号", self.redsys_terminal_var),
-            ("签名密钥/密码", self.redsys_key_var),
-            ("刷卡机串口", self.redsys_serial_var),
-            ("TPV Version", self.redsys_version_var),
-        ]
-        for label, variable in fields:
-            row = ttk.Frame(form)
-            row.pack(fill="x", pady=3)
-            ttk.Label(row, text=label, width=14).pack(side="left")
-            if label == "服务端口":
-                ttk.Entry(row, textvariable=variable, width=35, state="readonly").pack(side="left")
-            elif label == "刷卡机串口":
-                combo = ttk.Combobox(row, textvariable=variable, width=32, state="readonly")
-                combo.pack(side="left")
-                combo["values"] = self._list_serial_ports()
-                if variable.get() and variable.get() not in combo["values"]:
-                    combo["values"] = tuple(combo["values"]) + (variable.get(),)
-                ttk.Button(row, text="刷新", command=lambda c=combo: self._refresh_redsys_ports(c)).pack(side="left", padx=5)
-            else:
-                entry_options = {"show": "*"} if variable is self.redsys_key_var else {}
-                ttk.Entry(row, textvariable=variable, width=35, **entry_options).pack(side="left")
-        ttk.Checkbutton(form, text="模拟模式", variable=self.redsys_simulate_var).pack(anchor="w", pady=5)
-        buttons = ttk.Frame(frame)
-        buttons.pack(anchor="w", padx=12, pady=8)
-        ttk.Button(buttons, text="启动 Redsys", command=self._start_redsys_from_gui).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="连接刷卡机", command=self._connect_redsys_from_gui).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="停止 Redsys", command=self._stop_redsys_from_gui).pack(side="left", padx=(0, 8))
-        ttk.Button(buttons, text="保存 Redsys 配置", command=self._save_redsys_config).pack(side="left")
-        ttk.Button(buttons, text="刷新状态", command=self._refresh_redsys_status).pack(side="left", padx=(8, 0))
-        ttk.Label(frame, textvariable=self.redsys_status_var, foreground="blue").pack(anchor="w", padx=12)
-        self.after(1500, self._poll_redsys_status)
-
-    def _poll_redsys_status(self) -> None:
-        self._refresh_redsys_status()
-        self.after(5000, self._poll_redsys_status)
-
-    def _refresh_redsys_status(self) -> None:
-        threading.Thread(target=self._check_redsys_health, daemon=True).start()
-
-    def _check_redsys_health(self) -> None:
-        try:
-            with urlopen("http://127.0.0.1:6971/health", timeout=3) as response:
-                health = json.loads(response.read().decode("utf-8"))
-            if health.get("simulate"):
-                status = "服务在线（模拟模式）"
-            else:
-                configured_port = self.redsys_serial_var.get().strip().upper()
-                detected_ports = [str(port).strip().upper() for port in self._list_serial_ports()]
-                if configured_port and configured_port not in detected_ports:
-                    status = f"服务在线，但未检测到 {configured_port} 刷卡机"
-                else:
-                    status = "服务在线，等待刷卡机连接"
-            self.after(0, self.redsys_status_var.set, status)
-        except Exception:
-            self.after(0, self.redsys_status_var.set, "服务未启动或无法访问（127.0.0.1:6971）")
-
-    def _refresh_redsys_ports(self, combo: ttk.Combobox) -> None:
-        ports = self._list_serial_ports()
-        current = self.redsys_serial_var.get().strip()
-        if current and current not in ports:
-            ports.append(current)
-        combo["values"] = ports
-
-    def _load_redsys_config_values(self) -> None:
-        if not REDSYS_CONFIG.exists():
-            return
-        try:
-            text = REDSYS_CONFIG.read_text(encoding="utf-8")
-            patterns = {
-                "redsys_port_var": r"(?m)^\s*port:\s*['\"]?([^'\"\s]+)",
-                "redsys_merchant_var": r"(?m)^\s*comercio:\s*['\"]?([^'\"\s]+)",
-                "redsys_terminal_var": r"(?m)^\s*terminal:\s*['\"]?([^'\"\s]+)",
-                "redsys_key_var": r"(?m)^\s*clave_firma:\s*['\"]?([^'\"\s]+)",
-                "redsys_serial_var": r"(?m)^\s*puerto:\s*['\"]?([^'\"\s]+)",
-                "redsys_version_var": r"(?m)^\s*version:\s*['\"]?([^'\"\s]+)",
-            }
-            for variable_name, pattern in patterns.items():
-                match = re.search(pattern, text)
-                if match:
-                    getattr(self, variable_name).set(match.group(1))
-            simulate = re.search(r"(?m)^\s*simulate:\s*(true|false)", text, re.IGNORECASE)
-            if simulate:
-                self.redsys_simulate_var.set(simulate.group(1).lower() == "true")
-        except OSError as exc:
-            self.redsys_status_var.set(f"读取配置失败: {exc}")
-
-    def _save_redsys_config(self) -> None:
-        if not REDSYS_CONFIG.exists():
-            self.redsys_status_var.set("Redsys 配置文件不存在")
-            return
-        try:
-            self.config_store.update_local_config(redsys_enabled=bool(self.redsys_enabled_var.get()))
-            text = REDSYS_CONFIG.read_text(encoding="utf-8")
-            replacements = {
-                r"(?m)^(\s*port:)\s*.*$": f"\\1 '{self.redsys_port_var.get().strip()}'",
-                r"(?m)^(\s*comercio:)\s*.*$": f"\\1 '{self.redsys_merchant_var.get().strip()}'",
-                r"(?m)^(\s*terminal:)\s*.*$": f"\\1 '{self.redsys_terminal_var.get().strip()}'",
-                r"(?m)^(\s*clave_firma:)\s*.*$": f"\\1 '{self.redsys_key_var.get().strip()}'",
-                r"(?m)^(\s*puerto:)\s*.*$": f"\\1 '{self.redsys_serial_var.get().strip()}'",
-                r"(?m)^(\s*version:)\s*.*$": f"\\1 '{self.redsys_version_var.get().strip()}'",
-                r"(?m)^(\s*simulate:)\s*.*$": f"\\1 {'true' if self.redsys_simulate_var.get() else 'false'}",
-            }
-            for pattern, replacement in replacements.items():
-                text, count = re.subn(pattern, replacement, text, count=1)
-                if count == 0:
-                    raise ValueError(f"配置项未找到: {pattern}")
-            REDSYS_CONFIG.write_text(text, encoding="utf-8")
-            self.redsys_status_var.set("Redsys 配置已保存，重启服务后生效")
-        except Exception as exc:
-            self.redsys_status_var.set(f"保存失败: {exc}")
-
-    def _start_redsys_from_gui(self) -> None:
-        self.redsys_enabled_var.set(True)
-        self._save_redsys_config()
-        threading.Thread(target=self._run_redsys_service, daemon=True).start()
-
-    def _connect_redsys_from_gui(self) -> None:
-        """启动服务后，显式调用 Redsys 桥接 DLL 连接刷卡机。"""
-        self._save_redsys_config()
-        self.redsys_status_var.set("正在连接刷卡机，请稍候...")
-        threading.Thread(target=self._check_redsys_status, daemon=True).start()
-
-    def _stop_redsys_from_gui(self) -> None:
-        self.redsys_enabled_var.set(False)
-        self.config_store.update_local_config(redsys_enabled=False)
-        self._stop_redsys_process()
-        self.redsys_status_var.set("Redsys 服务已停止")
 
     def _refresh_ports(self) -> None:
         """扫描可用串口"""
@@ -1241,12 +1159,15 @@ class SettingsWindow(tk.Toplevel):
     def _load_config(self) -> None:
         """从 config_store 加载电子秤设置（与 runtime 读取同一份 local_config）"""
         local = self.config_store.get_local_config()
+        saved_protocol = str(local.get("service_protocol") or "http").strip().lower()
+        saved_protocol = saved_protocol if saved_protocol in {"http", "https"} else "http"
+        self.proto_var.set(saved_protocol)
+        self._activate_protocol_config(saved_protocol)
+        local = self.config_store.get_local_config()
         self.scale_port_var.set(local.get("scale_port", DEFAULT_SCALE_PORT))
         self.scale_baudrate_var.set(local.get("scale_baudrate", DEFAULT_SCALE_BAUDRATE))
         self.scale_timeout_var.set(str(local.get("scale_timeout", 1.2)))
         self.scale_inter_command_delay_var.set(str(local.get("scale_inter_command_delay", 0.05)))
-        saved_protocol = str(local.get("service_protocol") or "https").strip().lower()
-        self.proto_var.set(saved_protocol if saved_protocol in {"http", "https"} else "https")
         self.auto_start_var.set(bool(local.get("auto_start_service", True)))
 
         # 根据已保存的 brand 选中对应预设
@@ -1299,14 +1220,17 @@ class TrayApplication:
 
         def on_quit(icon, item):
             icon.stop()
-            # 在主线程销毁 tk 窗口
-            root.after(0, root.destroy)
+            root.after(0, self._shutdown, root)
 
         def on_settings(icon, item):
             root.after(0, self._show_settings, root)
 
         def on_open_web(icon, item):
-            webbrowser.open(f"http://127.0.0.1:{HTTP_PORT}")
+            local = self.config_store.get_local_config()
+            protocol = str(local.get("service_protocol") or "http").strip().lower()
+            protocol = protocol if protocol in {"http", "https"} else "http"
+            port = HTTP_PORT if protocol == "http" else HTTPS_PORT
+            webbrowser.open(f"{protocol}://127.0.0.1:{port}")
 
         # 图标
         icon_image = self._load_icon(pystray)
@@ -1338,6 +1262,18 @@ class TrayApplication:
 
         # 主线程运行 tkinter 事件循环
         root.mainloop()
+
+    def _shutdown(self, root: Tk) -> None:
+        """Stop child processes owned by the GUI before leaving the tray app."""
+        window = self.settings_window
+        try:
+            window_exists = window is not None and bool(window.winfo_exists())
+        except tk.TclError:
+            window_exists = False
+        if window_exists:
+            window._close_customer_display_screen()
+            window._stop_service_process()
+        root.destroy()
 
     # ------------------------------------------------------------------
 

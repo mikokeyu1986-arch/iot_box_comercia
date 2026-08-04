@@ -1,18 +1,46 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
 import json
 import logging
 import os
 import ssl
+import time
 from http.cookies import SimpleCookie
 from typing import Any
 from urllib.parse import quote_plus, urlsplit, urlunsplit
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 import websockets
 from websockets.exceptions import ConnectionClosed, InvalidStatus, WebSocketException
+
+# ============================================================
+# 专用线程池：隔离 Cloud Bridge 的阻塞 IO 操作，避免耗尽
+# asyncio 默认线程池导致整台 Box HTTP 服务假死。
+# 场景：Odoo 8070 变慢时 _fetch_session_id(10s) +
+# _send_operation_confirmation(8s) 同时抢占默认池 8 线程 → 池满 → 所有 to_thread 排队。
+# ============================================================
+_CLOUD_EXECUTOR: concurrent.futures.ThreadPoolExecutor | None = None
+_CONFIRM_SEMAPHORE = asyncio.Semaphore(2)  # 最多 2 个确认请求并发
+
+# ------------------------------------------------------------
+# 自定义 opener：禁止 HTTP 重定向跟随。
+# Odoo /web/login 返回 302 时，默认 urlopen 会跟随重定向，
+# 可能触发无限循环。我们需要从 302 响应的 Set-Cookie 中提取 session_id。
+# ------------------------------------------------------------
+class _NoRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None  # 不跟随任何重定向
+
+    http_error_301 = redirect_request
+    http_error_302 = redirect_request
+    http_error_303 = redirect_request
+    http_error_307 = redirect_request
+    http_error_308 = redirect_request
+
+_NO_REDIRECT_OPENER = build_opener(_NoRedirectHandler())
 
 from .config_store import ConfigStore
 from .dev_logger import dev_log
@@ -66,6 +94,33 @@ class OdooCloudBridge:
         self._ws_max_size = max(1024 * 1024, int(os.getenv("IOT_WS_MAX_SIZE", str(16 * 1024 * 1024))))
         self._ws_max_queue = max(16, int(os.getenv("IOT_WS_MAX_QUEUE", "256")))
 
+    # ------------------------------------------------------------------
+    # Dedicated thread pool helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _ensure_cloud_executor() -> concurrent.futures.ThreadPoolExecutor:
+        global _CLOUD_EXECUTOR
+        if _CLOUD_EXECUTOR is None:
+            _CLOUD_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+                max_workers=4, thread_name_prefix="odoo-cloud"
+            )
+        return _CLOUD_EXECUTOR
+
+    @staticmethod
+    async def _cloud_to_thread(fn, *args):
+        """Run blocking IO in the dedicated cloud executor, NOT the default pool."""
+        executor = OdooCloudBridge._ensure_cloud_executor()
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(executor, fn, *args)
+
+    @staticmethod
+    def shutdown_cloud_executor() -> None:
+        global _CLOUD_EXECUTOR
+        if _CLOUD_EXECUTOR is not None:
+            _CLOUD_EXECUTOR.shutdown(wait=True)
+            _CLOUD_EXECUTOR = None
+
     async def run_forever(self) -> None:
         while not self._stop_event.is_set():
             connection = self.config_store.get_connection()
@@ -90,7 +145,12 @@ class OdooCloudBridge:
                 continue
 
             try:
-                session_id = await asyncio.to_thread(self._fetch_session_id, server_url, db_name)
+                # 使用专用线程池 + 超时保护，防止 Odoo 8070 慢时
+                # _fetch_session_id 阻塞默认 asyncio 线程池导致整台 Box 假死
+                session_id = await asyncio.wait_for(
+                    self._cloud_to_thread(self._fetch_session_id, server_url, db_name),
+                    timeout=15.0,
+                )
                 await self._ws_loop(server_url, iot_channel, last_message_id, session_id)
             except asyncio.CancelledError:
                 raise
@@ -317,7 +377,7 @@ class OdooCloudBridge:
             return False
 
         if message_type == "server_clear":
-            await asyncio.to_thread(self._re_register_after_server_clear, server_url)
+            await self._cloud_to_thread(self._re_register_after_server_clear, server_url)
             return True
         if message_type != "iot_action":
             return False
@@ -498,14 +558,17 @@ class OdooCloudBridge:
                 str(exc),
             )
         try:
-            confirm_started_at = asyncio.get_running_loop().time()
-            await asyncio.to_thread(
-                self._send_operation_confirmation,
-                server_url,
-                session_id,
-                device_identifier,
-                status,
-            )
+            # Semaphore 限流：最多 2 个确认请求同时进行，
+            # 防止 Odoo 推送大量 action 时确认请求耗尽线程池
+            async with _CONFIRM_SEMAPHORE:
+                confirm_started_at = asyncio.get_running_loop().time()
+                await self._cloud_to_thread(
+                    self._send_operation_confirmation,
+                    server_url,
+                    session_id,
+                    device_identifier,
+                    status,
+                )
             _logger.info(
                 "Cloud bridge confirmation sent session_id=%s device_identifier=%s action=%s status=%s duration_ms=%.1f",
                 session_id,
@@ -704,7 +767,10 @@ class OdooCloudBridge:
         req = Request(login_url, method="GET")
         ssl_context = None if self.verify_ssl else ssl._create_unverified_context()
         try:
-            with urlopen(req, timeout=10, context=ssl_context) as resp:
+            # 使用禁止重定向的 opener：Odoo /web/login 返回 302 时，
+            # 默认 urlopen 会跟随 → 可能无限循环。
+            # 我们直接从 302 响应的 Set-Cookie 中提取 session_id。
+            with _NO_REDIRECT_OPENER.open(req, timeout=10, context=ssl_context) as resp:
                 set_cookies = resp.headers.get_all("Set-Cookie", [])
                 _logger.debug(
                     "Fetched session_id from %s http_status=%s cookies_count=%s verify_ssl=%s",

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import re
 import threading
@@ -24,7 +23,7 @@ WAKE_BYTE = ord("W")
 KNOWN_UNITS = {"TJ", "TL", "SJ", "LB", "KG", "G"}
 
 # 预编译正则：流式解析在热路径上每帧都会调用，避免 re 模块内部缓存查找开销。
-_RE_EPELSA_FRAME = re.compile(r"(-?\d{3}\.\d{3})\r")
+_RE_EPELSA_FRAME = re.compile(r"(-?\d+\.\d+)\r")
 _RE_ZFOC_STX_ETX = re.compile(r"\x02([ -~]{1,32})\r\x03")
 _RE_ZFOC_DIGITS = re.compile(r"\x02([0-9 ]{4,8})\r")
 _RE_NUMBER = re.compile(r"[-+]?\d+(?:[.,]\d+)?")
@@ -174,22 +173,6 @@ def _parse_stream_ascii_weight(frame: bytes, implicit_decimals: int | None) -> f
         return None
 
 
-def detect_serial_ports() -> list[dict[str, str]]:
-    try:
-        import serial.tools.list_ports
-    except ImportError:
-        return []
-    ports = serial.tools.list_ports.comports()
-    result: list[dict[str, str]] = []
-    for p in sorted(ports, key=lambda x: x.device):
-        result.append({
-            "device": p.device,
-            "description": p.description or "",
-            "manufacturer": p.manufacturer or "",
-        })
-    return result
-
-
 class ScaleConfig:
     def __init__(self, data: dict[str, Any] | None = None) -> None:
         data = data or {}
@@ -233,15 +216,13 @@ class ScaleService:
     READ_CHUNK_SIZE = 128
     BUFFER_TRIM_THRESHOLD = 1024
     BUFFER_TRIM_KEEP = 256
-    # 重量变化阈值 (kg)：超过此值才向前端推送，避免微小抖动刷屏。
+    # 重量变化阈值 (kg)：超过此值才向 Odoo EventBus 推送，避免微小抖动刷屏。
     # 设为极小值，让任何变化都立即推送
     WEIGHT_CHANGE_THRESHOLD = 0.00001
     # 零值确认时长：从非零读到 0 时，先暂存不推送，持续此秒数仍为 0
     # 才认定为「真实归零」（取走物品）并推送/缓存；期间出现非 0 则视为毛刺丢弃。
     # 这样既过滤了不完整帧解析出的瞬态 0，又不会挡住真实的归零读数。
     ZERO_CONFIRM_SECONDS = 0.2
-    # SSE 订阅者队列容量
-    SUBSCRIBER_QUEUE_MAXSIZE = 64
     # 无变化时每隔多少秒强制推送一次保活心跳（0 表示禁用）
     # 0.2 秒保活，确保 POS 持续收到更新
     KEEPALIVE_INTERVAL_SECONDS = 0.2
@@ -259,10 +240,6 @@ class ScaleService:
         self._cache_lock = threading.Lock()
         self._monitor: ScaleMonitor | None = None
         self._monitor_signature: tuple | None = None
-        # 实时推送相关（SSE，默认关闭 —— POS 通过 EventBus 接收重量即可，
-        # 仅当本地 Web UI 需要实时显示秤盘跳动时才开启 SSE）
-        self._subscribers: set[asyncio.Queue[dict[str, Any]]] = set()
-        self._subscribers_lock = threading.Lock()
         self._last_pushed_weight: float | None = None
         self._last_pushed_at: float = 0.0
         # 零值确认：首次读到候选 0 的时刻（monotonic）。0.0 表示当前不在确认窗口。
@@ -274,14 +251,6 @@ class ScaleService:
         self._current_owner: str = ""
         # 按需读取：最后收到 read_once action 的时间
         self._last_action_at: float = 0.0
-
-    @property
-    def sse_enabled(self) -> bool:
-        """SSE 推送是否启用。默认关闭，由配置 scale_sse_enabled 控制。"""
-        try:
-            return bool(self._config_provider().get("scale_sse_enabled", False))
-        except Exception:
-            return False
 
     def set_owner(self, owner: str) -> None:
         """设置当前 POS 会话的 owner（对应 Odoo 19 driver.py 的 self.data["owner"] = session_id）。
@@ -333,19 +302,6 @@ class ScaleService:
         """绑定主事件循环，供 ScaleMonitor 子线程安全地推送重量事件。"""
         self._main_loop = loop
         _logger.info("ScaleService bound to main event loop")
-
-    def subscribe(self) -> asyncio.Queue[dict[str, Any]]:
-        """创建一个新的订阅者队列，用于接收实时重量事件。"""
-        queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=self.SUBSCRIBER_QUEUE_MAXSIZE)
-        with self._subscribers_lock:
-            self._subscribers.add(queue)
-        _logger.info("Scale subscriber added total=%s", len(self._subscribers))
-        return queue
-
-    def unsubscribe(self, queue: asyncio.Queue[dict[str, Any]]) -> None:
-        with self._subscribers_lock:
-            self._subscribers.discard(queue)
-        _logger.info("Scale subscriber removed total=%s", len(self._subscribers))
 
     def get_config(self) -> ScaleConfig:
         return ScaleConfig(self._config_provider())
@@ -400,9 +356,6 @@ class ScaleService:
         if should_publish:
             # 1. 始终通过 EventBus 发布给 Odoo POS（Event 模式）
             self._publish_to_event_bus(weight)
-            # 2. 仅当 SSE 开启时推送给本地 Web UI
-            if self.sse_enabled:
-                self._broadcast_sse(weight, stable=False)
 
     def _publish_to_event_bus(self, weight: float) -> None:
         """通过 EventBus 向 Odoo POS 发布重量事件（子线程安全调用）。
@@ -437,43 +390,6 @@ class ScaleService:
             )
         except RuntimeError:
             _logger.debug("EventBus publish failed: event loop closed")
-
-    def _broadcast_sse(self, weight: float, stable: bool = False) -> None:
-        """线程安全地向所有 SSE 订阅者推送重量事件（本地 Web UI）。"""
-        if self._main_loop is None or not self._main_loop.is_running():
-            return
-        with self._subscribers_lock:
-            subscribers = list(self._subscribers)
-        if not subscribers:
-            return
-        payload = {
-            "status": "success",
-            "weight_kg": round(weight, 3),
-            "unit": "kg",
-            "timestamp": time.time(),
-            "stable": stable,
-        }
-        for queue in subscribers:
-            try:
-                self._main_loop.call_soon_threadsafe(self._enqueue_payload, queue, payload)
-            except RuntimeError:
-                # 主循环已关闭，清理该订阅者
-                with self._subscribers_lock:
-                    self._subscribers.discard(queue)
-
-    def _enqueue_payload(self, queue: asyncio.Queue[dict[str, Any]], payload: dict[str, Any]) -> None:
-        """在主循环中安全入队，队列满时丢弃最旧事件保证最新数据可达。"""
-        try:
-            queue.put_nowait(payload)
-        except asyncio.QueueFull:
-            try:
-                queue.get_nowait()
-            except asyncio.QueueEmpty:
-                pass
-            try:
-                queue.put_nowait(payload)
-            except Exception:
-                pass
 
     def ensure_monitor(self) -> None:
         config = self.get_config()
@@ -514,11 +430,13 @@ class ScaleService:
             self._stop_monitor()
             return
         self.ensure_monitor()
-        self.read_weight(timeout_override=self.STREAM_READ_TIMEOUT)
+        # 不再调用 read_weight()：ScaleMonitor 已经打开 COM8 持续读取，
+        # _direct_read 会尝试打开第二个串口实例 → Windows 上 Access Denied。
+        # 重量数据由 ScaleMonitor 流式解析后通过 _set_cached_weight 缓存
+        # 并推送到 EventBus，调用方只需等待缓存就绪。
 
     def read_weight(self, timeout_override: float | None = None) -> float | None:
         self.ensure_monitor()
-        config = self.get_config()
 
         warmup = timeout_override if timeout_override is not None else self.MONITOR_WARMUP
         warmup = max(0.15, min(self.MONITOR_WARMUP, warmup))
@@ -528,6 +446,11 @@ class ScaleService:
             if cached is not None:
                 return cached
             time.sleep(0.05)
+
+        # 如果 ScaleMonitor 已在运行，COM8 被其占用，_direct_read 会因串口冲突
+        # (Windows: Access Denied) 而失败，返回已有缓存或 None 即可。
+        if self.is_monitor_running:
+            return self.get_cached_weight(max_age=999.0)
 
         return self._direct_read(timeout_override)
 
@@ -573,12 +496,15 @@ class ScaleService:
             port.close()
 
     def _read_epelsa_streaming(self, port: SharedSerialPort, timeout: float) -> float | None:
+        # Epelsa 持续推送模式：flush 后等待一帧数据抵达再开始读。
+        time.sleep(0.15)
         deadline = time.monotonic() + max(timeout, 0.8)
         buffer = b""
         while time.monotonic() < deadline:
             chunk = self._read_chunk(port)
             if not chunk:
-                break
+                time.sleep(0.02)
+                continue
             buffer += chunk
             weight = _extract_stream_weight(buffer, "epelsa")
             if weight is not None:
@@ -804,12 +730,17 @@ class ScaleMonitor:
 
     def _probe_epelsa(self, port: SharedSerialPort) -> float | None:
         try:
+            # Epelsa 56 PPI 持续推送约每 100ms 一帧（9600 baud）。
+            # flush_input 后 OS 缓冲区为空，立即 _read_chunk 几乎总是命中 in_waiting==0
+            # → break → 返回 None。等一帧数据抵达后再开始读取。
+            time.sleep(0.15)
             deadline = time.monotonic() + max(self._config.timeout, 0.8)
             buffer = b""
             while time.monotonic() < deadline:
                 chunk = self._read_chunk(port)
                 if not chunk:
-                    break
+                    time.sleep(0.02)  # 等待下一帧，不 break
+                    continue
                 buffer += chunk
                 weight = _extract_stream_weight(buffer, "epelsa")
                 if weight is not None:

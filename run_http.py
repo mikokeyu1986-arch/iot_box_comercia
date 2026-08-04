@@ -10,12 +10,17 @@ _DEFAULT_HTTP_PORT = os.getenv("IOT_HTTP_PORT", os.getenv("IOT_PORT", "8399"))
 os.environ.setdefault("IOT_CONFIG_PATH", str(BASE_DIR / "runtime_config_http.json"))
 os.environ.setdefault("IOT_IP", f"127.0.0.1:{_DEFAULT_HTTP_PORT}")
 
-from run_https import (
-    LOG_DIR,
-    _clear_spool_history,
-    _configure_windows_asyncio,
-    _write_fatal_log,
-)
+LOG_DIR = BASE_DIR / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+def _clear_spool_history() -> None:
+    return None
+
+def _configure_windows_asyncio() -> None:
+    return None
+
+def _write_fatal_log(exc: BaseException) -> None:
+    (LOG_DIR / "fatal.log").write_text(str(exc), encoding="utf-8")
 
 import uvicorn
 
@@ -74,7 +79,9 @@ def main() -> None:
         port=port,
         log_level="info",
         log_config=None,
-        access_log=True,
+        access_log=os.getenv("IOT_ACCESS_LOG", "0").strip().lower() in {"1", "true", "yes", "on"},
+        timeout_keep_alive=max(5, int(os.getenv("IOT_HTTP_KEEP_ALIVE_SECONDS", "30"))),
+        backlog=max(128, int(os.getenv("IOT_HTTP_BACKLOG", "2048"))),
     )
 
 

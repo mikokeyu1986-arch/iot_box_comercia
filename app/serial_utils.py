@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import os
 import re
 import threading
 from typing import Any
@@ -45,29 +44,6 @@ def _port_sort_key(device: str) -> tuple[int, str]:
     match = re.search(r"(\d+)", device)
     num = int(match.group(1)) if match else 9999
     return (num, device)
-
-
-def auto_detect_scale_port(existing_config: dict[str, Any] | None = None) -> str:
-    existing_config = existing_config or {}
-    configured = str(existing_config.get("scale_port") or "").strip()
-    if configured:
-        return configured
-
-    try:
-        import serial.tools.list_ports
-    except ImportError:
-        return ""
-
-    ports = serial.tools.list_ports.comports()
-    for port in ports:
-        desc = (port.description or "").upper()
-        mfr = (port.manufacturer or "").upper()
-        if any(kw in desc or kw in mfr for kw in ("SCALE", "BALANCE", "EPELSA", "ZFOC", "GRAM", "WEIGH")):
-            return port.device
-    for port in ports:
-        if "COM" in port.device.upper():
-            return port.device
-    return ""
 
 
 class SharedSerialPort:

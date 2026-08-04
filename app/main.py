@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
+import ipaddress
 import json
 import logging
 import os
 import socket
-import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from xml.etree import ElementTree as ET
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -24,6 +26,16 @@ from .device_manager import DeviceManager
 from .event_bus import EventBus
 from .models import IoTEvent
 from .odoo_sync import OdooSyncService
+from .receipt_builder import build_receipt_lines
+from .receipt_builder import build_kitchen_ticket_lines
+from .kitchen_template_store import (
+    load_kitchen_template,
+    reset_kitchen_template,
+    save_kitchen_template,
+    validate_kitchen_template,
+)
+from .receipt_template_store import load_template, reset_template, save_template, validate_template
+from .version import APP_VERSION
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -61,15 +73,12 @@ def _detect_local_ip() -> str:
 
 
 IOT_IP = _detect_local_ip()
-
-
-IOT_IP = _detect_local_ip()
-IOT_VERSION = os.getenv("IOT_VERSION", "2026.04.10")
+IOT_VERSION = os.getenv("IOT_VERSION", APP_VERSION)
 SPOOL_CLEAN_INTERVAL_SECONDS = int(os.getenv("IOT_SPOOL_CLEAN_INTERVAL_SECONDS", "1800"))
 SPOOL_RETENTION_SECONDS = int(os.getenv("IOT_SPOOL_RETENTION_SECONDS", "1800"))
 IOT_ENABLE_CLOUD_BRIDGE = os.getenv("IOT_ENABLE_CLOUD_BRIDGE", "1").strip().lower() in {"1", "true", "yes", "on"}
 IOT_SSL_VERIFY = os.getenv("IOT_SSL_VERIFY", "1").strip().lower() in {"1", "true", "yes", "on"}
-IOT_P12_PASSWORD = os.getenv("IOT_P12_PASSWORD", "odoo")
+IOT_P12_PASSWORD = os.getenv("IOT_P12_PASSWORD", "")
 
 _logger = logging.getLogger(__name__)
 _PRINT_ACTIONS = {"print_receipt", "print_receipt_escpos"}
@@ -102,15 +111,82 @@ def _perf_log(message: str) -> None:
         return
     print(message, flush=True)
 
-app = FastAPI(title="Restaurant Native Print IoT Box Runtime", version="0.1.0")
+app = FastAPI(title="Restaurant Native Print IoT Box Runtime", version=APP_VERSION)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+def _is_loopback_request(request: Request) -> bool:
+    host = request.client.host if request.client else ""
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return host.lower() == "localhost"
+
+
+def _is_same_origin(request: Request) -> bool:
+    origin = request.headers.get("origin", "").strip()
+    if not origin:
+        return True
+    return urlsplit(origin).netloc.lower() == request.headers.get("host", "").lower()
+
+
+def _is_paired_odoo_origin(request: Request) -> bool:
+    origin = request.headers.get("origin", "").strip()
+    paired_url = str(config_store.get_connection().get("url") or "").strip()
+    if not origin or not paired_url:
+        return False
+    supplied = urlsplit(origin)
+    expected = urlsplit(paired_url)
+    return (supplied.scheme.lower(), supplied.netloc.lower()) == (
+        expected.scheme.lower(), expected.netloc.lower(),
+    )
+
+
+@app.middleware("http")
+async def protect_admin_api(request: Request, call_next):
+    """Keep the administration API local unless a shared token is supplied."""
+    configured_token = os.getenv("IOT_ADMIN_TOKEN", "").strip()
+    supplied_token = request.headers.get("x-iot-admin-token", "").strip()
+    token_ok = bool(configured_token) and hmac.compare_digest(configured_token, supplied_token)
+    local_ok = _is_loopback_request(request) and _is_same_origin(request)
+    if request.url.path.startswith("/api/"):
+        if not (local_ok or token_ok):
+            return JSONResponse(
+                status_code=403,
+                content={"status": "error", "detail": "Administration API is local-only"},
+            )
+    protected_device_paths = {
+        "/hw_proxy/print_xml_receipt",
+        "/hw_proxy/print_receipt",
+        "/hw_proxy/print_receipt_escpos",
+        "/hw_proxy/open_cashbox",
+        "/hw_proxy/open_cashbox_direct",
+    }
+    if request.url.path in protected_device_paths:
+        if not (local_ok or token_ok or _is_paired_odoo_origin(request)):
+            return JSONResponse(
+                status_code=403,
+                content={"status": "error", "detail": "Untrusted print origin"},
+            )
+    return await call_next(request)
 app.mount("/assets", StaticFiles(directory=STATIC_DIR), name="assets")
+
+
+@app.get("/healthz")
+async def healthz(request: Request) -> dict[str, Any]:
+    """Lightweight readiness probe used by the desktop launcher."""
+    return {
+        "status": "ready",
+        "protocol": request.url.scheme,
+        "version": APP_VERSION,
+        "iot_ip": IOT_IP,
+    }
 
 event_bus = EventBus()
 config_store = ConfigStore(CONFIG_PATH)
@@ -159,11 +235,14 @@ async def startup_tasks() -> None:
         ssl_verify=IOT_SSL_VERIFY,
     )
     app.state.certificate_error = ""
-    try:
-        certificate_manager.ensure()
-    except Exception as exc:
-        app.state.certificate_error = str(exc)
-        _logger.exception("Certificate generation failed; continuing without downloadable certificates")
+    if str(config_store.get_local_config().get("ssl_engine") or "").strip() == "secure_https":
+        try:
+            # HTTPS startup already prepared this exact LAN certificate before
+            # Uvicorn loaded it. This is now a cheap consistency check only.
+            certificate_manager.ensure()
+        except Exception as exc:
+            app.state.certificate_error = str(exc)
+            _logger.exception("Certificate consistency check failed")
     app.state.spool_cleanup_task = asyncio.create_task(_spool_cleanup_loop())
     await device_manager.startup()
     if scale_service is not None:
@@ -202,6 +281,8 @@ async def shutdown_tasks() -> None:
             await cloud_task
         except asyncio.CancelledError:
             pass
+    # 释放 Cloud Bridge 专用线程池
+    OdooCloudBridge.shutdown_cloud_executor()
 
 
 class JsonRpcRequest(BaseModel):
@@ -302,7 +383,10 @@ async def _execute_iot_action_background(session_id: str, device_identifier: str
 
 @app.get("/", response_class=FileResponse)
 async def homepage() -> FileResponse:
-    return FileResponse(STATIC_DIR / "index.html")
+    return FileResponse(
+        STATIC_DIR / "index.html",
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
+    )
 
 
 
@@ -394,15 +478,18 @@ async def iot_action(request: JsonRpcRequest) -> dict[str, Any]:
                 # 设置 owner = session_id，后续 ScaleMonitor 发布事件时使用此 owner
                 # 对应 Odoo 19 driver.py: self.data["owner"] = session_id
                 scale_service.set_owner(session_id)
-                # 先读一次重量并立即发布事件（此时 ScaleMonitor 还没启动，串口可用）
-                # 这样 POS 能立即收到重量响应，不需要等 ScaleMonitor 启动
+                # 先启动 ScaleMonitor（打开 COM8 一次），再读缓存。
+                # 之前先 read_hw_proxy_scale 再 touch_action 会导致：
+                # 1. _direct_read 打开 COM8 读一次关闭
+                # 2. ScaleMonitor 再打开 COM8
+                # 这个开-关-开窗口在 Windows 上可能导致串口驱动不稳定
+                # （DTR/RTS 抖动、驱动重初始化延迟），直接导致后续无法读取。
+                scale_service.touch_action()
                 if action in {"read_once", "read"}:
-                    weight = scale_service.read_hw_proxy_scale()
+                    # ScaleMonitor 刚启动，仅从缓存读取（不调用 _direct_read 以避免串口冲突）
+                    weight = scale_service.get_cached_weight(max_age=2.0)
                     if weight is not None:
                         scale_service.publish_weight_event(weight)
-                # 然后启动 ScaleMonitor 按需持续读取（每 0.25 秒 probe 一次）
-                # 重量变化时自动通过 EventBus 推送给 POS
-                scale_service.touch_action()
                 _logger.info(
                     "IOT scale action session_id=%s device_identifier=%s action=%s owner=%s",
                     session_id, device_identifier, action, session_id,
@@ -474,7 +561,7 @@ async def iot_event(request: JsonRpcRequest) -> dict[str, Any]:
 
 @app.get("/api/status")
 async def api_status() -> dict[str, Any]:
-    server_connection = config_store.get_connection()
+    server_connection = config_store.get_public_connection()
     certificates = certificate_manager.status()
     certificates["startup_error"] = getattr(app.state, "certificate_error", "")
     devices = device_manager.device_list()
@@ -954,7 +1041,7 @@ async def api_connect(payload: dict[str, Any]) -> dict[str, Any]:
     )
     if IOT_ENABLE_CLOUD_BRIDGE:
         await cloud_bridge.request_reconnect(message="Odoo connection updated from /api/connect")
-    return {"status": "success", "server_connection": config_store.get_connection()}
+    return {"status": "success", "server_connection": config_store.get_public_connection()}
 
 
 @app.post("/api/disconnect")
@@ -1011,9 +1098,119 @@ async def api_settings(payload: dict[str, Any]) -> dict[str, Any]:
         update_fields=update_fields,
         sync_message=sync_message,
         devices=device_manager.device_list(),
-        connection=config_store.get_connection(),
+        connection=config_store.get_public_connection(),
     )
     return {"status": "success", "local_config": config, "sync_message": sync_message}
+
+
+def _receipt_preview_order() -> dict[str, Any]:
+    sample_path = BASE_DIR / "templates" / "escpos_receipt" / "example_order.json"
+    if sample_path.exists():
+        try:
+            return json.loads(sample_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return {
+        "name": "Order 00042",
+        "pos_reference": "Order 00042",
+        "tracking_number": "42",
+        "date_order": "2026-08-01 20:30:00",
+        "finalized": True,
+        "currency": {"symbol": "€", "position": "after"},
+        "company": {"name": "示例餐厅", "street": "Calle Ejemplo 1", "city": "Las Palmas"},
+        "config": {"receipt_language": "zh_CN", "receipt_footer": "谢谢惠顾\n欢迎再次光临"},
+        "user_id": {"name": "收银员"},
+        "table_id": {"table_number": "A08"},
+        "lines": [
+            {"qty": 2, "full_product_name": "牛肉汉堡 (加芝士)", "price_subtotal_incl": 17},
+            {"qty": 1, "full_product_name": "可乐", "price_subtotal_incl": 3},
+        ],
+        "amountTaxes": 1.31,
+        "tax_names": ["IGIC 7%"],
+        "totalDue": 20,
+        "amountPaid": 20,
+        "payment_lines": [{"name": "现金", "amount": 20}],
+    }
+
+
+@app.get("/api/receipt-template")
+async def api_receipt_template() -> dict[str, Any]:
+    return {"status": "success", "template": load_template()}
+
+
+@app.put("/api/receipt-template")
+async def api_save_receipt_template(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        template = save_template(payload)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {"status": "success", "template": template}
+
+
+@app.delete("/api/receipt-template")
+async def api_reset_receipt_template() -> dict[str, Any]:
+    return {"status": "success", "template": reset_template()}
+
+
+@app.post("/api/receipt-template/preview")
+async def api_preview_receipt_template(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        template = validate_template(payload)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    preview_lines = None
+    try:
+        last_request = json.loads((SPOOL_DIR / "last_escpos_request.json").read_text(encoding="utf-8"))
+        structured = last_request.get("structured") if isinstance(last_request, dict) else None
+        if isinstance(structured, dict) and structured:
+            preview_lines = device_manager._build_structured_receipt_lines(structured, template=template)
+    except FileNotFoundError:
+        # No print request exists yet after a fresh start.  Use the built-in
+        # preview order below instead of reporting a false GUI error.
+        _logger.info("No last Odoo print request yet; using sample receipt preview")
+    except (OSError, json.JSONDecodeError):
+        _logger.exception("Failed to read last Odoo request for receipt preview")
+    if preview_lines is None:
+        preview_lines = build_receipt_lines(_receipt_preview_order(), template=template, preview_fields=True)
+    return {
+        "status": "success",
+        "template": template,
+        "lines": preview_lines,
+    }
+
+
+@app.get("/api/kitchen-template")
+async def api_kitchen_template() -> dict[str, Any]:
+    return {"status": "success", "template": load_kitchen_template()}
+
+
+@app.put("/api/kitchen-template")
+async def api_save_kitchen_template(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        template = save_kitchen_template(payload)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {"status": "success", "template": template}
+
+
+@app.delete("/api/kitchen-template")
+async def api_reset_kitchen_template() -> dict[str, Any]:
+    return {"status": "success", "template": reset_kitchen_template()}
+
+
+@app.post("/api/kitchen-template/preview")
+async def api_preview_kitchen_template(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        template = validate_kitchen_template(payload)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+    return {
+        "status": "success",
+        "template": template,
+        "lines": build_kitchen_ticket_lines(
+            _receipt_preview_order(), template=template, preview_fields=True,
+        ),
+    }
 
 
 
@@ -1031,7 +1228,6 @@ async def api_scale_config() -> dict[str, Any]:
         "timeout": float(config.get("scale_timeout") or 1.2),
         "brand": str(config.get("scale_brand") or "zfoc"),
         "inter_command_delay": float(config.get("scale_inter_command_delay") or 0.05),
-        "sse_enabled": bool(config.get("scale_sse_enabled", False)),
         "is_monitor_running": scale_service.is_monitor_running if scale_service else False,
     }
 
@@ -1091,55 +1287,6 @@ async def api_scale_ports() -> dict[str, Any]:
         return {"status": "error", "message": str(exc)}
 
 
-@app.get("/api/scale/stream")
-async def api_scale_stream(request: Request) -> Any:
-    """SSE 端点：电子秤重量变化时实时推送给前端。
-
-    前端使用 ``new EventSource('/api/scale/stream')`` 订阅。
-    每当 ScaleMonitor 读到新重量且变化超过阈值时，推送一条 ``data:`` 事件。
-    无变化时每 15 秒发送心跳注释行保活。
-    """
-    if scale_service is None:
-        return {"status": "error", "message": "Scale service not available"}
-
-    queue = scale_service.subscribe()
-
-    async def event_generator():
-        try:
-            # 连接建立后立即推送一次当前缓存值（若存在），避免前端长时间空白
-            cached = scale_service.get_cached_weight(max_age=30.0)
-            if cached is not None:
-                initial_payload = {
-                    "status": "success",
-                    "weight_kg": round(cached, 3),
-                    "unit": "kg",
-                    "timestamp": time.time(),
-                    "stable": False,
-                }
-                yield f"data: {json.dumps(initial_payload, ensure_ascii=False)}\n\n"
-            while True:
-                if await request.is_disconnected():
-                    break
-                try:
-                    payload = await asyncio.wait_for(queue.get(), timeout=15.0)
-                    yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
-                except asyncio.TimeoutError:
-                    # SSE 心跳注释行，防止代理/浏览器超时断开
-                    yield ": heartbeat\n\n"
-        finally:
-            scale_service.unsubscribe(queue)
-
-    return StreamingResponse(
-        event_generator(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
-
-
 @app.post("/api/scale/save_config")
 async def api_scale_save_config(payload: dict[str, Any]) -> dict[str, Any]:
     update_fields: dict[str, Any] = {}
@@ -1153,8 +1300,6 @@ async def api_scale_save_config(payload: dict[str, Any]) -> dict[str, Any]:
         update_fields["scale_brand"] = str(payload.get("scale_brand", "zfoc")).strip().lower()
     if "scale_inter_command_delay" in payload:
         update_fields["scale_inter_command_delay"] = float(payload.get("scale_inter_command_delay", 0.05))
-    if "scale_sse_enabled" in payload:
-        update_fields["scale_sse_enabled"] = bool(payload.get("scale_sse_enabled", False))
     config = config_store.update_local_config(**update_fields)
     # 按需读取模式：保存配置后不自动启动监控
     # 监控会在 POS 打开称重界面（调用 read_once action）时自动启动
