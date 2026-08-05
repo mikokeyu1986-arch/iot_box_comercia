@@ -1,27 +1,28 @@
 {
   "server_connection": {
-    "connected": false,
-    "url": "",
-    "token": "",
-    "db_uuid": "",
+    "connected": true,
+    "url": "http://127.0.0.1:8070",
+    "token": "a8f0fa57ccedbe0cfd9a699ec7f3b10b",
+    "db_uuid": "328d3c2a-8c35-11f1-8296-010101010000",
     "enterprise_code": "",
-    "db_name": "",
-    "last_sync_ok": false,
-    "last_sync_message": "",
-    "iot_channel": ""
+    "db_name": "comercial",
+    "last_sync_ok": true,
+    "last_sync_message": "Synced with Odoo /iot/setup",
+    "iot_channel": "iot_channel-ad87d3ad05651133ff57c0ed8163566c",
+    "last_websocket_message_id": 0
   },
   "local_config": {
-    "ssl_engine": "secure_https",
-    "local_url": "https://127.0.0.1:8398",
+    "ssl_engine": "plain_http",
+    "local_url": "http://127.0.0.1:8399",
     "iot_identifier": "custom-iot-box-a9f549a11170",
     "printer_identifier": "printer_main",
     "primary_printer_queue": "RP-12N",
     "enabled_printer_queues": [],
-    "scale_port": "",
+    "scale_port": "COM8",
     "scale_baudrate": 9600,
     "scale_timeout": 1.2,
     "scale_inter_command_delay": 0.05,
-    "scale_brand": "zfoc",
+    "scale_brand": "epelsa",
     "redsys_merchant_code": "",
     "redsys_merchant_terminal": "1",
     "redsys_signature_key": "",
@@ -31,6 +32,15 @@
     "card_reader_port": "",
     "card_reader_baudrate": 9600,
     "service_protocol": "http",
-    "auto_start_service": true
+    "auto_start_service": true,
+    "vfd_enabled": true,
+    "vfd_port": "COM10",
+    "vfd_baudrate": 9600,
+    "vfd_width": 20,
+    "vfd_rows": 2,
+    "vfd_protocol": "cd5220",
+    "vfd_encoding": "ascii",
+    "vfd_clear_hex": "0C",
+    "vfd_line2_hex": ""
   }
 }
