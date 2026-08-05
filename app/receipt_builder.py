@@ -181,6 +181,9 @@ def _order_date_text(order: dict[str, Any]) -> str:
 
 
 def _tracking_text(order: dict[str, Any]) -> str:
+    config = order.get("config") if isinstance(order.get("config"), dict) else {}
+    if not (order.get("is_restaurant") or config.get("module_pos_restaurant")):
+        return ""
     tracking = _text(order.get("tracking_number"))
     if tracking:
         return f"#{tracking}"

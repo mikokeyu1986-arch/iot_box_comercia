@@ -101,10 +101,14 @@ class StructuredReceiptMixin:
         if table_value and not table_value.upper().startswith(("MESA ", "TABLE ")):
             table_value = f"MESA {table_value}"
         tracking_value = (
-            receipt.get("tracking_number")
-            or receipt.get("takeaway_number")
-            or receipt.get("pickup_number")
-            or receipt.get("order_number")
+            (
+                receipt.get("tracking_number")
+                or receipt.get("takeaway_number")
+                or receipt.get("pickup_number")
+                or receipt.get("order_number")
+            )
+            if receipt.get("is_restaurant")
+            else ""
         )
         if tracking_value:
             tracking_value = str(tracking_value).strip()

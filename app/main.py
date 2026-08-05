@@ -36,6 +36,7 @@ from .kitchen_template_store import (
 )
 from .receipt_template_store import load_template, reset_template, save_template, validate_template
 from .version import APP_VERSION
+from .vfd_writer import write_serial as write_vfd_serial
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -156,7 +157,12 @@ async def protect_admin_api(request: Request, call_next):
     token_ok = bool(configured_token) and hmac.compare_digest(configured_token, supplied_token)
     local_ok = _is_loopback_request(request) and _is_same_origin(request)
     if request.url.path.startswith("/api/"):
-        if not (local_ok or token_ok):
+        # POS runs on the paired Odoo origin (8070) and must be able to push
+        # VFD customer-display data to the local IOTBOX (8399). Keep all
+        # administration APIs local, but allow this one device route from the
+        # already-bound Odoo origin.
+        paired_vfd = request.url.path == "/api/vfd/display" and _is_paired_odoo_origin(request)
+        if not (local_ok or token_ok or paired_vfd):
             return JSONResponse(
                 status_code=403,
                 content={"status": "error", "detail": "Administration API is local-only"},
@@ -1379,3 +1385,45 @@ async def api_scale_save_config(payload: dict[str, Any]) -> dict[str, Any]:
         "local_config": config,
         "is_monitor_running": scale_service.is_monitor_running if scale_service else False,
     }
+
+
+@app.post("/api/vfd/display")
+async def api_vfd_display(payload: dict[str, Any]) -> dict[str, Any]:
+    """Receive POS customer-display data and write it to the local VFD."""
+    config = config_store.get_local_config()
+    if not bool(config.get("vfd_enabled", False)):
+        raise HTTPException(status_code=503, detail="VFD is disabled")
+    port = str(config.get("vfd_port") or "").strip()
+    if not port:
+        raise HTTPException(status_code=503, detail="VFD serial port is not configured")
+    try:
+        lines = await asyncio.to_thread(
+            write_vfd_serial,
+            payload,
+            port=port,
+            baudrate=int(config.get("vfd_baudrate") or 9600),
+            width=int(config.get("vfd_width") or 20),
+            rows=int(config.get("vfd_rows") or 2),
+            protocol=str(config.get("vfd_protocol") or "cd5220"),
+            encoding=str(config.get("vfd_encoding") or "ascii"),
+            clear_hex=str(config.get("vfd_clear_hex") or "0C"),
+            line2_hex=str(config.get("vfd_line2_hex") or ""),
+        )
+    except Exception as exc:
+        _logger.exception("VFD display write failed port=%s", port)
+        raise HTTPException(status_code=502, detail=f"VFD write failed: {exc}") from exc
+    return {"ok": True, "lines": lines, "action": payload.get("action", "display")}
+
+
+@app.post("/api/vfd/save_config")
+async def api_vfd_save_config(payload: dict[str, Any]) -> dict[str, Any]:
+    update_fields: dict[str, Any] = {
+        "vfd_enabled": bool(payload.get("vfd_enabled", False)),
+        "vfd_port": str(payload.get("vfd_port", "")).strip(),
+        "vfd_baudrate": int(payload.get("vfd_baudrate", 9600) or 9600),
+        "vfd_protocol": str(payload.get("vfd_protocol", "cd5220")).strip().lower() or "cd5220",
+    }
+    if update_fields["vfd_protocol"] not in {"cd5220", "plain"}:
+        raise HTTPException(status_code=400, detail="Unsupported VFD protocol")
+    config = config_store.update_local_config(**update_fields)
+    return {"status": "success", "local_config": config}

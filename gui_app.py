@@ -165,6 +165,9 @@ class SettingsWindow(tk.Toplevel):
         self.tab_scale = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_scale, text="  电子秤  ")
         self._build_scale_tab()
+        self.tab_vfd = ttk.Frame(self.notebook)
+        self.notebook.add(self.tab_vfd, text="  VFD 客显  ")
+        self._build_vfd_tab()
         self.tab_customer_display = ttk.Frame(self.notebook)
         self.notebook.add(self.tab_customer_display, text="  Pantalla del cliente  ")
         self._build_customer_display_tab()
@@ -818,6 +821,62 @@ class SettingsWindow(tk.Toplevel):
 
     # ------------------------------------------------------------------
 
+    def _build_vfd_tab(self) -> None:
+        frame = self.tab_vfd
+        local = self.config_store.get_local_config()
+        self.vfd_enabled_var = BooleanVar(value=bool(local.get("vfd_enabled", False)))
+        self.vfd_port_var = StringVar(value=str(local.get("vfd_port", "")))
+        self.vfd_baudrate_var = IntVar(value=int(local.get("vfd_baudrate", 9600) or 9600))
+        self.vfd_protocol_var = StringVar(value=str(local.get("vfd_protocol", "cd5220") or "cd5220"))
+        self.vfd_status_var = StringVar(value="VFD COM port is managed by IoTBOX")
+
+        ttk.Checkbutton(frame, text="Enable VFD customer display", variable=self.vfd_enabled_var).pack(
+            anchor="w", padx=12, pady=12
+        )
+        form = ttk.LabelFrame(frame, text="VFD serial settings", padding=10)
+        form.pack(fill="x", padx=12, pady=5)
+        row = ttk.Frame(form)
+        row.pack(fill="x", pady=4)
+        ttk.Label(row, text="COM port", width=16).pack(side="left")
+        self.vfd_port_combo = ttk.Combobox(row, textvariable=self.vfd_port_var, width=20)
+        self.vfd_port_combo.pack(side="left")
+        ttk.Button(row, text="Refresh", command=self._refresh_ports).pack(side="left", padx=8)
+        row = ttk.Frame(form)
+        row.pack(fill="x", pady=4)
+        ttk.Label(row, text="Baudrate", width=16).pack(side="left")
+        ttk.Combobox(row, textvariable=self.vfd_baudrate_var, values=(9600, 19200, 38400), width=18).pack(side="left")
+        row = ttk.Frame(form)
+        row.pack(fill="x", pady=4)
+        ttk.Label(row, text="Protocol", width=16).pack(side="left")
+        ttk.Combobox(row, textvariable=self.vfd_protocol_var, values=("cd5220", "plain"), state="readonly", width=18).pack(side="left")
+        ttk.Button(frame, text="Save VFD configuration", command=self._on_save_vfd).pack(anchor="w", padx=12, pady=10)
+        ttk.Label(frame, textvariable=self.vfd_status_var, foreground="blue").pack(anchor="w", padx=12)
+
+    def _on_save_vfd(self) -> None:
+        try:
+            values = {
+                "vfd_enabled": bool(self.vfd_enabled_var.get()),
+                "vfd_port": self.vfd_port_var.get().strip(),
+                "vfd_baudrate": int(self.vfd_baudrate_var.get() or 9600),
+                "vfd_protocol": self.vfd_protocol_var.get().strip().lower() or "cd5220",
+            }
+            self.config_store.update_local_config(**values)
+            local_url = str(self.config_store.get_local_config().get("local_url") or "http://127.0.0.1:8399")
+            request = Request(
+                local_url.rstrip("/") + "/api/vfd/save_config",
+                data=json.dumps(values).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(request, timeout=3) as response:
+                if response.status >= 400:
+                    raise RuntimeError(f"IOTBOX rejected VFD configuration: HTTP {response.status}")
+            self.vfd_status_var.set(f"Saved: {values['vfd_port'] or '(no COM port)'}")
+            self._append_log(f"VFD configuration saved (port={values['vfd_port']})")
+        except Exception as exc:
+            self.vfd_status_var.set(f"Save failed: {exc}")
+            messagebox.showerror("VFD configuration", f"Save failed: {exc}")
+
     def _build_customer_display_tab(self) -> None:
         frame = self.tab_customer_display
         local = self.config_store.get_local_config()
@@ -917,6 +976,8 @@ class SettingsWindow(tk.Toplevel):
         """扫描可用串口"""
         ports = self._list_serial_ports()
         self.port_combo["values"] = ports
+        if hasattr(self, "vfd_port_combo"):
+            self.vfd_port_combo["values"] = ports
         if ports:
             self.lbl_port_status.config(text=f"找到 {len(ports)} 个串口", foreground="green")
         else:
@@ -1289,6 +1350,10 @@ class SettingsWindow(tk.Toplevel):
         self.scale_baudrate_var.set(local.get("scale_baudrate", DEFAULT_SCALE_BAUDRATE))
         self.scale_timeout_var.set(str(local.get("scale_timeout", 1.2)))
         self.scale_inter_command_delay_var.set(str(local.get("scale_inter_command_delay", 0.05)))
+        self.vfd_enabled_var.set(bool(local.get("vfd_enabled", False)))
+        self.vfd_port_var.set(str(local.get("vfd_port", "")))
+        self.vfd_baudrate_var.set(int(local.get("vfd_baudrate", 9600) or 9600))
+        self.vfd_protocol_var.set(str(local.get("vfd_protocol", "cd5220") or "cd5220"))
         self.auto_start_var.set(bool(local.get("auto_start_service", True)))
 
         # 根据已保存的 brand 选中对应预设

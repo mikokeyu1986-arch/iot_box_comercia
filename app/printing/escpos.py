@@ -501,7 +501,15 @@ class EscposEncodingMixin:
         return bytes([0x1B, 0x74, codepage])
 
     def _escpos_line_spacing_command(self) -> bytes:
-        return bytes([0x1B, 0x33, 48])
+        # ESC/POS line spacing is measured in printer dots.  48 was too tight
+        # for the current receipt layout; keep it configurable for different
+        # printer mechanisms while using a more readable default.
+        try:
+            spacing = int(os.getenv("IOT_ESCPOS_LINE_SPACING", "60"))
+        except ValueError:
+            spacing = 60
+        spacing = max(0, min(255, spacing))
+        return bytes([0x1B, 0x33, spacing])
 
     def _escpos_text_newline(self) -> bytes:
         return b"\n"

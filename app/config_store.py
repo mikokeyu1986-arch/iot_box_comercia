@@ -35,6 +35,15 @@ class ConfigStore:
             "scale_timeout": 1.2,
             "scale_inter_command_delay": 0.05,
             "scale_brand": "zfoc",
+            "vfd_enabled": False,
+            "vfd_port": "",
+            "vfd_baudrate": 9600,
+            "vfd_width": 20,
+            "vfd_rows": 2,
+            "vfd_protocol": "cd5220",
+            "vfd_encoding": "ascii",
+            "vfd_clear_hex": "0C",
+            "vfd_line2_hex": "",
         }
 
     def _load(self) -> dict[str, Any]:
