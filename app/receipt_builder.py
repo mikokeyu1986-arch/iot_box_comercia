@@ -14,9 +14,12 @@ Supports:
 
 from __future__ import annotations
 
+import base64
 import logging
+import os
 import re
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
@@ -486,6 +489,26 @@ def _portal_url(order: dict[str, Any]) -> str:
     return f"{base_url}/pos/ticket" if base_url else ""
 
 
+def _local_receipt_logo_src() -> str:
+    """Return a data-URI for the IoT Box's locally cached receipt logo.
+
+    Reads ``<resource>/assets/logo.png``, which the IoT Box refreshes from
+    Odoo via its logo sync (/api/logo/sync).  Returns "" when no local logo
+    is available so the logo block is simply skipped.
+    """
+    resource_dir = Path(os.getenv("IOT_RESOURCE_DIR", str(Path(__file__).resolve().parents[1])))
+    logo_path = resource_dir / "assets" / "logo.png"
+    try:
+        if not logo_path.is_file():
+            return ""
+        data = logo_path.read_bytes()
+        if not data:
+            return ""
+        return f"data:image/png;base64,{base64.b64encode(data).decode('ascii')}"
+    except OSError:
+        return ""
+
+
 def _order_barcode_src(order: dict[str, Any]) -> str:
     """Return Odoo's Code128 image URL for the receipt number."""
     explicit_url = _text(order.get("order_barcode_url") or order.get("barcode_url"))
@@ -509,6 +532,17 @@ def _ticket_qr_src(order: dict[str, Any]) -> str:
     token = order["access_token"]
     validation_url = f"{base_url}/pos/ticket/validate?access_token={token}"
     return f"{base_url}/report/barcode?{urlencode({'barcode_type': 'QR', 'value': validation_url, 'width': 180, 'height': 180})}"
+
+
+def _ticket_code_fallback(order: dict[str, Any]) -> str:
+    """Derive a printable ticket code from the receipt reference when the
+    order has no ``ticket_code`` (e.g. orders created via the Movi API).
+    Returns the trailing digits of the reference, max 5 characters."""
+    reference = _text(order.get("pos_reference") or order.get("name"))
+    match = re.search(r"(\d+)\s*$", reference)
+    if match:
+        return match.group(1)[-5:]
+    return ""
 
 
 def _program_type(item: dict[str, Any]) -> str:
@@ -1216,7 +1250,10 @@ def build_receipt_lines(
     # 1. Logo
     # ══════════════════════════════════════════════════════════════════
     block_start = len(lines)
-    logo_url = _text(config.get("receiptLogoUrl"))
+    # The IoT Box renders the logo from its local cache (assets/logo.png,
+    # refreshed from Odoo via /api/logo/sync).  Falls back to a caller-
+    # provided logo URL only when no local logo is cached yet.
+    logo_url = _local_receipt_logo_src() or _text(config.get("receiptLogoUrl"))
     if logo_url:
         lines.append({
             "type": "image", "src": logo_url, "align": "left",
@@ -1346,7 +1383,10 @@ def build_receipt_lines(
             continue
         name, options = _split_name_and_options(raw_line)
         discounted = _line_discounted_total(raw_line)
-        if discounted <= 0:
+        # A combo (套餐) parent row can have zero price while its children carry
+        # the amount; keep the row (with its combo items) so the combo is not
+        # dropped from the receipt.
+        if discounted <= 0 and not options:
             continue
         discount_pct = _line_discount_pct(raw_line)
         original = _line_original_total(raw_line, discounted)
@@ -1410,10 +1450,24 @@ def build_receipt_lines(
         })
 
     # ══════════════════════════════════════════════════════════════════
-    # 12. Tax (use actual tax names from system)
+    # 12. Tax (per tax group when available, matching the desktop POS)
     # ══════════════════════════════════════════════════════════════════
+    tax_details = order.get("tax_details")
     tax_amount = order.get("amountTaxes")
-    if tax_amount is not None and _decimal(tax_amount) > 0:
+    if isinstance(tax_details, list) and tax_details:
+        # One row per tax group — same as the native POS receipt.
+        for td in tax_details:
+            if not isinstance(td, dict):
+                continue
+            label = _text(td.get("group_name") or td.get("group_label") or L["TAX"])
+            amt = _decimal(td.get("tax_amount") or td.get("tax_amount_currency"))
+            if amt > 0:
+                lines.append({
+                    "type": "header_meta_line",
+                    "left_text": label,
+                    "right_text": _money(order, amt),
+                })
+    elif tax_amount is not None and _decimal(tax_amount) > 0:
         tax_names = order.get("tax_names", [])
         tax_label = ", ".join(tax_names) if tax_names else L["TAX"]
         lines.append({
@@ -1510,16 +1564,27 @@ def build_receipt_lines(
     invoice_qr_lines = []
     if is_final:
         qr_src = _ticket_qr_src(order)
+        portal = _portal_url(order)
         ticket_code = _text(order.get("ticket_code"))
-        if qr_src or ticket_code:
+        if not ticket_code:
+            # Fallback so "Code:" still prints for orders created without a
+            # ticket code (e.g. via the Movi API).  Uses the trailing digits
+            # of the receipt reference (max 5), matching Odoo's 5-char code.
+            ticket_code = _ticket_code_fallback(order)
+        if qr_src or portal or ticket_code:
             invoice_qr_lines.append({"text": "", "align": "left"})
+            # Same prompt the native POS shows above the invoice QR code.
+            invoice_qr_lines.append({
+                "text": "NECESITA UNA FACTURA",
+                "align": "center", "bold": True,
+                "classes": ["portal-title"],
+            })
         if qr_src:
             invoice_qr_lines.append({
                 "type": "image", "src": qr_src, "align": "center",
                 "classes": ["portal-qr"],
                 "width": 180, "height": 180, "image_kind": "qr",
             })
-        portal = _portal_url(order)
         url_mode = _text(order.get("company", {}).get("point_of_sale_ticket_portal_url_display_mode"))
         if portal:
             invoice_qr_lines.append({"text": portal, "align": "center", "classes": ["portal-url"]})

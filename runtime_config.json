@@ -1,22 +1,21 @@
 {
   "server_connection": {
-    "connected": true,
-    "url": "http://127.0.0.1:8070",
-    "token": "a8f0fa57ccedbe0cfd9a699ec7f3b10b",
-    "db_uuid": "328d3c2a-8c35-11f1-8296-010101010000",
+    "connected": false,
+    "url": "",
+    "token": "",
+    "db_uuid": "",
     "enterprise_code": "",
-    "db_name": "comercial",
-    "last_sync_ok": true,
-    "last_sync_message": "Synced with Odoo /iot/setup",
-    "iot_channel": "iot_channel-ad87d3ad05651133ff57c0ed8163566c",
-    "last_websocket_message_id": 0
+    "db_name": "",
+    "last_sync_ok": false,
+    "last_sync_message": "",
+    "iot_channel": ""
   },
   "local_config": {
     "ssl_engine": "plain_http",
     "local_url": "http://127.0.0.1:8399",
     "iot_identifier": "custom-iot-box-a9f549a11170",
     "printer_identifier": "printer_main",
-    "primary_printer_queue": "RP-12N",
+    "primary_printer_queue": "EPSON TM-T88VII Receipt",
     "enabled_printer_queues": [],
     "scale_port": "COM8",
     "scale_baudrate": 9600,
@@ -31,7 +30,7 @@
     "redsys_timeout": 120,
     "card_reader_port": "",
     "card_reader_baudrate": 9600,
-    "service_protocol": "http",
+    "service_protocol": "https",
     "auto_start_service": true,
     "vfd_enabled": true,
     "vfd_port": "COM10",
@@ -41,6 +40,12 @@
     "vfd_protocol": "cd5220",
     "vfd_encoding": "ascii",
     "vfd_clear_hex": "0C",
-    "vfd_line2_hex": ""
+    "vfd_line2_hex": "",
+    "epson_discovery_enabled": true,
+    "epson_printer_hosts": [],
+    "epson_discovery_subnets": [],
+    "epson_discovery_port": 9100,
+    "epson_discovery_timeout": 0.12,
+    "epson_discovery_workers": 64
   }
 }

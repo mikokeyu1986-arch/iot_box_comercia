@@ -494,12 +494,19 @@ class OdooCloudBridge:
             receipt_summary=receipt_summary,
             payload_keys=sorted(action_data.keys()),
         )
-        for device_identifier in device_identifiers:
-            resolved_device = str(device_identifier)
-            task = asyncio.create_task(
-                self._execute_and_confirm(server_url, session_id, resolved_device, dict(action_data))
-            )
-            self._track_action_task(task)
+        action_jobs = self._split_kitchen_ticket_jobs(action_data)
+        for job_index, action_job in enumerate(action_jobs):
+            for device_identifier in device_identifiers:
+                resolved_device = str(device_identifier)
+                task = asyncio.create_task(
+                    self._execute_and_confirm(
+                        server_url,
+                        f"{session_id}-line-{job_index}",
+                        resolved_device,
+                        action_job,
+                    )
+                )
+                self._track_action_task(task)
         _logger.info(
             "Cloud bridge iot_action scheduled session_id=%s devices=%s action=%s schedule_ms=%.1f pending_tasks=%s",
             session_id,
@@ -509,6 +516,33 @@ class OdooCloudBridge:
             len(self._action_tasks),
         )
         return False
+
+    @staticmethod
+    def _split_kitchen_ticket_jobs(action_data: dict[str, Any]) -> list[dict[str, Any]]:
+        """Turn a native POS kitchen ticket into one job per product line.
+
+        Native POS sends all new lines as one ``order_data`` payload.  Splitting
+        at the IoT boundary guarantees separate physical tickets even when a
+        POS browser still has an older cached frontend bundle.
+        """
+        receipt = action_data.get("receipt")
+        order_data = receipt.get("order_data") if isinstance(receipt, dict) else None
+        changes = order_data.get("changes") if isinstance(order_data, dict) else None
+        lines = changes.get("data") if isinstance(changes, dict) else None
+        if str(action_data.get("action") or "") != "print_receipt_escpos" or not isinstance(lines, list) or len(lines) < 2:
+            return [dict(action_data)]
+        jobs = []
+        for line in lines:
+            if not isinstance(line, dict):
+                continue
+            job = dict(action_data)
+            job_receipt = dict(receipt)
+            job_order = dict(order_data)
+            job_order["changes"] = {**changes, "data": [dict(line)], "groupedData": []}
+            job_receipt["order_data"] = job_order
+            job["receipt"] = job_receipt
+            jobs.append(job)
+        return jobs or [dict(action_data)]
 
     def _track_action_task(self, task: asyncio.Task[None]) -> None:
         self._action_tasks.add(task)

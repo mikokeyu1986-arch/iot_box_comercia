@@ -56,7 +56,7 @@ class NetworkPrinterMixin:
         if not raw_value:
             return None
         host = raw_value
-        port = int(config.get("raw_printer_port", 9100) or 9100)
+        port = int(device.metadata.get("raw_tcp_port") or config.get("raw_printer_port", 9100) or 9100)
         if ":" in raw_value:
             host_part, port_part = raw_value.rsplit(":", 1)
             host = host_part.strip()

@@ -274,7 +274,14 @@ class ReceiptMetadataMixin:
             return None
         pos_reference = match.group(1)
 
-        root_dir = Path(__file__).resolve().parents[5]
+        # Locate the optional dev project root used to look up the customer in
+        # a local Odoo database. The hard-coded depth (parents[5]) only matches
+        # the original developer checkout; guard it so a shallower deployment
+        # (e.g. d:\\odoo\\iot_box_comercia) does not crash the preview/print.
+        try:
+            root_dir = Path(__file__).resolve().parents[5]
+        except IndexError:
+            return None
         query_python = root_dir / ".venv" / "Scripts" / "python.exe"
         config_path = root_dir / "instances" / "dev" / "config" / "odoo.conf"
         if not query_python.exists() or not config_path.exists():

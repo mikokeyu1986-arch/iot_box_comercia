@@ -42,6 +42,10 @@ def main() -> None:
         iot_ip=f"127.0.0.1:{port}",
         p12_password=os.getenv("IOT_P12_PASSWORD", "odoo"),
     )
+    try:
+        certs.install_windows_trusted_root()
+    except Exception as exc:
+        logging.getLogger(__name__).warning("Could not install IoT HTTPS certificate in the Windows trust store: %s", exc)
     logging.getLogger(__name__).info("Starting IoT HTTPS runtime host=%s port=%s", host, port)
     uvicorn.run(
         app,

@@ -2,10 +2,10 @@
 
 
 a = Analysis(
-    ['C:\\Users\\Miko win\\Documents\\odoo\\custom_addons\\iot_box_comercia\\gui_app.py'],
+    ['gui_app.py'],
     pathex=[],
     binaries=[],
-    datas=[('C:\\Users\\Miko win\\Documents\\odoo\\custom_addons\\iot_box_comercia\\web', 'web'), ('C:\\Users\\Miko win\\Documents\\odoo\\custom_addons\\iot_box_comercia\\certs', 'certs'), ('C:\\Users\\Miko win\\Documents\\odoo\\custom_addons\\iot_box_comercia\\runtime_config.json', '.')],
+    datas=[('web', 'web'), ('certs', 'certs'), ('redsys', 'redsys'), ('runtime_config.json', '.')],
     hiddenimports=['pystray', 'pywebview'],
     hookspath=[],
     hooksconfig={},
@@ -32,7 +32,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['C:\\Users\\Miko win\\Documents\\odoo\\custom_addons\\iot_box_comercia\\assets\\iotbox-icon.ico'],
+    icon=['assets/iotbox-icon.ico'],
 )
 coll = COLLECT(
     exe,

@@ -35,7 +35,7 @@ _logger = logging.getLogger(__name__)
 
 DEFAULT_UPDATE_MANIFEST_URL = os.getenv(
     "IOT_UPDATE_MANIFEST_URL",
-    "https://api.github.com/repos/mikokeyu1986-arch/iot_box_comercia/contents/manifest.json?ref=master",
+    "https://api.github.com/repos/mikokeyu1986-arch/iot_box_comercia/contents/manifest.json?ref=main",
 )
 
 # ---------------------------------------------------------------------------

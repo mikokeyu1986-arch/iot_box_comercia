@@ -36,7 +36,10 @@ from tkinter.scrolledtext import ScrolledText
 from typing import Any
 
 # 将项目根目录加入 path
-BASE_DIR = Path(__file__).resolve().parent
+# A frozen PyInstaller program executes its code from ``_internal``.  Runtime
+# configuration, REDSYS and sibling service EXEs instead live beside the GUI
+# executable, so keep that as the application base directory.
+BASE_DIR = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) else Path(__file__).resolve().parent
 sys.path.insert(0, str(BASE_DIR))
 
 from app.config_store import ConfigStore
@@ -84,6 +87,7 @@ HTTP_SCRIPT = BASE_DIR / "run_http.py"
 HTTPS_SCRIPT = BASE_DIR / "run_https.py"
 REDSYS_SCRIPT = BASE_DIR / "redsys" / "server" / "main.py"
 REDSYS_CONFIG = BASE_DIR / "redsys" / "config.yaml"
+REDSYS_EXECUTABLE = BASE_DIR / "runtime" / "redsys_server" / "redsys_server.exe"
 REDSYS_PORT = 6971
 
 
@@ -121,6 +125,9 @@ class SettingsWindow(tk.Toplevel):
         # 自动启动服务
         if self.auto_start_var.get():
             self.after(500, self._on_start)
+        # REDSYS is an independent local service and must also be available
+        # after a normal GUI launch, even when the IoT HTTP service is off.
+        self.after(700, self._start_redsys_automatically)
         if self.customer_display_enabled_var.get():
             self.after(1800, self._launch_customer_display_screen)
         self.after(60000, self._auto_update_check)
@@ -304,13 +311,20 @@ class SettingsWindow(tk.Toplevel):
             ("版本号", self.redsys_version_var),
         )):
             ttk.Label(settings, text=label).grid(row=row, column=0, sticky="w", pady=4)
-            ttk.Entry(settings, textvariable=variable, width=34).grid(row=row, column=1, sticky="ew", pady=4)
+            if variable is self.redsys_com_var:
+                self.redsys_com_combo = ttk.Combobox(settings, textvariable=variable, width=31, state="readonly")
+                self.redsys_com_combo.grid(row=row, column=1, sticky="ew", pady=4)
+                ttk.Button(settings, text="\u5237\u65b0", command=self._refresh_redsys_ports).grid(row=row, column=2, padx=(6, 0))
+            else:
+                ttk.Entry(settings, textvariable=variable, width=34).grid(row=row, column=1, sticky="ew", pady=4)
         ttk.Checkbutton(settings, text="模拟模式（不连接真实刷卡机）", variable=self.redsys_simulate_var).grid(row=5, column=0, columnspan=2, sticky="w", pady=6)
         settings.columnconfigure(1, weight=1)
         self.redsys_status_var = StringVar(value="状态：未运行")
         ttk.Label(frame, textvariable=self.redsys_status_var, font=("Segoe UI", 11)).pack(anchor="w", padx=12)
         buttons = ttk.Frame(frame)
         buttons.pack(fill="x", padx=10, pady=10)
+        ttk.Button(buttons, text="\u6d4b\u8bd5\u8bfb\u5361\u5668", command=self._test_redsys_reader).pack(side="left", padx=(0, 8))
+        ttk.Button(buttons, text="\u6d4b\u8bd5\u5237\u5361", command=self._test_redsys_payment).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="保存配置", command=self._save_redsys_config).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="启动 REDSYS", command=self._start_redsys_from_gui).pack(side="left", padx=(0, 8))
         ttk.Button(buttons, text="停止 REDSYS", command=self._stop_redsys_from_gui).pack(side="left", padx=(0, 8))
@@ -328,6 +342,20 @@ class SettingsWindow(tk.Toplevel):
         self.redsys_password_var.set(value("clave_firma"))
         self.redsys_version_var.set(value("version") or "6.1")
         self.redsys_simulate_var.set(value("simulate").lower() == "true")
+        self._refresh_redsys_ports()
+
+    def _refresh_redsys_ports(self) -> None:
+        """Refresh the REDSYS COM-port dropdown while retaining the configured port."""
+        configured = self._normalize_windows_com_port(self.redsys_com_var.get())
+        ports = {
+            normalized
+            for port in [*self._list_serial_ports(), configured]
+            if (normalized := self._normalize_windows_com_port(port))
+        }
+        choices = sorted(ports, key=self._serial_port_sort_key)
+        self.redsys_com_combo["values"] = choices
+        if configured:
+            self.redsys_com_var.set(configured)
 
     def _save_redsys_config(self) -> None:
         if not REDSYS_CONFIG.exists():
@@ -350,6 +378,82 @@ class SettingsWindow(tk.Toplevel):
         self._save_redsys_config()
         self._ensure_redsys_service()
         self.redsys_status_var.set("状态：运行中" if self._is_local_port_open(REDSYS_PORT) else "状态：启动失败")
+
+    def _start_redsys_automatically(self) -> None:
+        """Start REDSYS after the GUI is ready without overwriting its configuration."""
+        self._ensure_redsys_service()
+        if self._is_local_port_open(REDSYS_PORT):
+            self.redsys_status_var.set("状态：运行中")
+        else:
+            self.redsys_status_var.set("状态：启动失败")
+
+    def _test_redsys_reader(self) -> None:
+        """Safely initialize the configured PinPad without creating a payment."""
+        self._save_redsys_config()
+        self._ensure_redsys_service()
+        if not self._is_local_port_open(REDSYS_PORT):
+            self.redsys_status_var.set("\u72b6\u6001\uff1a\u8bfb\u5361\u5668\u6d4b\u8bd5\u5931\u8d25\uff08REDSYS \u670d\u52a1\u672a\u8fd0\u884c\uff09")
+            return
+        self.redsys_status_var.set("\u72b6\u6001\uff1a\u6b63\u5728\u6d4b\u8bd5\u8bfb\u5361\u5668\u2026")
+
+        def run_test() -> None:
+            error: Exception | None = None
+            for attempt in range(3):
+                try:
+                    request = Request(f"http://127.0.0.1:{REDSYS_PORT}/connect", method="GET")
+                    with urlopen(request, timeout=30) as response:
+                        payload = json.loads(response.read().decode("utf-8"))
+                    if not payload.get("connected"):
+                        raise RuntimeError(str(payload.get("error") or "\u8bfb\u5361\u5668\u672a\u8fde\u63a5"))
+                    self.after(0, self.redsys_status_var.set, "\u72b6\u6001\uff1a\u8bfb\u5361\u5668\u8fde\u63a5\u6210\u529f\uff08\u672a\u53d1\u8d77\u4ed8\u6b3e\uff09")
+                    self.after(0, self._append_log, "REDSYS \u8bfb\u5361\u5668\u6d4b\u8bd5\u6210\u529f\uff1aCOM \u7aef\u53e3\u4e0e\u6865\u63a5\u6b63\u5e38")
+                    return
+                except Exception as exc:
+                    error = exc
+                    if attempt < 2:
+                        time.sleep(1)
+            self.after(0, self.redsys_status_var.set, f"\u72b6\u6001\uff1a\u8bfb\u5361\u5668\u6d4b\u8bd5\u5931\u8d25\uff08{error}\uff09")
+            self.after(0, self._append_log, f"REDSYS \u8bfb\u5361\u5668\u6d4b\u8bd5\u5931\u8d25\uff1a{error}")
+
+        threading.Thread(target=run_test, daemon=True).start()
+
+    def _test_redsys_payment(self) -> None:
+        """Run an explicitly confirmed, low-value payment through the real PinPad."""
+        if not messagebox.askyesno(
+            "\u6d4b\u8bd5\u5237\u5361",
+            "\u5c06\u53d1\u8d77\u4e00\u7b14 0.01 EUR \u7684\u771f\u5b9e\u6d4b\u8bd5\u4ed8\u6b3e\u3002\n"
+            "\u8bf7\u53ea\u5728\u5df2\u51c6\u5907\u6d4b\u8bd5\u5361\u6216\u53ef\u53d6\u6d88\u4ea4\u6613\u65f6\u7ee7\u7eed\u3002",
+            parent=self,
+        ):
+            return
+        self._save_redsys_config()
+        self._ensure_redsys_service()
+        if not self._is_local_port_open(REDSYS_PORT):
+            self.redsys_status_var.set("\u72b6\u6001\uff1a\u6d4b\u8bd5\u5237\u5361\u5931\u8d25\uff08REDSYS \u670d\u52a1\u672a\u8fd0\u884c\uff09")
+            return
+        invoice = f"GUI-TEST-{int(time.time())}"
+        self.redsys_status_var.set("\u72b6\u6001\uff1a\u7b49\u5f85\u8bfb\u5361\u5668\u5b8c\u6210 0.01 EUR \u6d4b\u8bd5\u4ed8\u6b3e\u2026")
+
+        def run_payment() -> None:
+            try:
+                request = Request(
+                    f"http://127.0.0.1:{REDSYS_PORT}/pay",
+                    data=json.dumps({"type": "PAGO", "amount": 0.01, "invoice": invoice}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urlopen(request, timeout=130) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                operation = payload.get("operation") or {}
+                if not payload.get("success"):
+                    raise RuntimeError(str(operation.get("message") or payload.get("warning") or "\u4ed8\u6b3e\u672a\u5b8c\u6210"))
+                self.after(0, self.redsys_status_var.set, "\u72b6\u6001\uff1a\u6d4b\u8bd5\u5237\u5361\u6210\u529f")
+                self.after(0, self._append_log, f"REDSYS \u6d4b\u8bd5\u5237\u5361\u6210\u529f (invoice={invoice})")
+            except Exception as exc:
+                self.after(0, self.redsys_status_var.set, f"\u72b6\u6001\uff1a\u6d4b\u8bd5\u5237\u5361\u5931\u8d25\uff08{exc}\uff09")
+                self.after(0, self._append_log, f"REDSYS \u6d4b\u8bd5\u5237\u5361\u5931\u8d25\uff1a{exc}")
+
+        threading.Thread(target=run_payment, daemon=True).start()
 
     def _stop_redsys_from_gui(self) -> None:
         proc = getattr(self, "_redsys_proc", None)
@@ -383,8 +487,13 @@ class SettingsWindow(tk.Toplevel):
             return
         try:
             redsys_env = os.environ.copy()
+            command = (
+                [str(REDSYS_EXECUTABLE), "--config", str(REDSYS_CONFIG)]
+                if getattr(sys, "frozen", False) and REDSYS_EXECUTABLE.exists()
+                else [sys.executable, str(REDSYS_SCRIPT), "--config", str(REDSYS_CONFIG)]
+            )
             self._redsys_proc = subprocess.Popen(
-                [sys.executable, str(REDSYS_SCRIPT), "--config", str(REDSYS_CONFIG)],
+                command,
                 cwd=str(BASE_DIR),
                 env=redsys_env,
                 stdout=subprocess.DEVNULL,
@@ -790,6 +899,7 @@ class SettingsWindow(tk.Toplevel):
         self.port_combo = ttk.Combobox(row1, textvariable=self.scale_port_var, width=20)
         self.port_combo.pack(side="left")
         ttk.Button(row1, text="刷新串口", command=self._refresh_ports).pack(side="left", padx=5)
+        ttk.Button(row1, text="手动添加", command=self._add_manual_port).pack(side="left", padx=5)
         self.lbl_port_status = ttk.Label(row1, text="", foreground="gray")
         self.lbl_port_status.pack(side="left", padx=5)
 
@@ -841,6 +951,7 @@ class SettingsWindow(tk.Toplevel):
         self.vfd_port_combo = ttk.Combobox(row, textvariable=self.vfd_port_var, width=20)
         self.vfd_port_combo.pack(side="left")
         ttk.Button(row, text="Refresh", command=self._refresh_ports).pack(side="left", padx=8)
+        ttk.Button(row, text="Add port", command=lambda: self._add_manual_port(target="vfd")).pack(side="left")
         row = ttk.Frame(form)
         row.pack(fill="x", pady=4)
         ttk.Label(row, text="Baudrate", width=16).pack(side="left")
@@ -974,7 +1085,7 @@ class SettingsWindow(tk.Toplevel):
 
     def _refresh_ports(self) -> None:
         """扫描可用串口"""
-        ports = self._list_serial_ports()
+        ports = self._serial_port_choices(self._list_serial_ports())
         self.port_combo["values"] = ports
         if hasattr(self, "vfd_port_combo"):
             self.vfd_port_combo["values"] = ports
@@ -982,6 +1093,56 @@ class SettingsWindow(tk.Toplevel):
             self.lbl_port_status.config(text=f"找到 {len(ports)} 个串口", foreground="green")
         else:
             self.lbl_port_status.config(text="未找到串口", foreground="red")
+
+    def _add_manual_port(self, *, target: str = "scale") -> None:
+        """Add a Windows COM port that is not exposed by the system enumerator."""
+        from tkinter import simpledialog
+
+        value = simpledialog.askstring(
+            "手动添加串口",
+            "请输入串口名称（例如 COM9）：",
+            parent=self,
+        )
+        if value is None:
+            return
+        port = self._normalize_windows_com_port(value)
+        if not port:
+            messagebox.showerror("串口无效", "请输入有效的 Windows 串口名称，例如 COM9。")
+            return
+        target_var = self.vfd_port_var if target == "vfd" else self.scale_port_var
+        target_var.set(port)
+        ports = self._serial_port_choices(self._list_serial_ports(), extra_ports=[port])
+        self.port_combo["values"] = ports
+        if hasattr(self, "vfd_port_combo"):
+            self.vfd_port_combo["values"] = ports
+        self.lbl_port_status.config(text=f"已手动添加 {port}", foreground="blue")
+
+    def _serial_port_choices(self, detected_ports: list[str], *, extra_ports: list[str] | None = None) -> list[str]:
+        """Combine detected ports with configured/manual COM ports without losing them on refresh."""
+        candidates = [*detected_ports, self.scale_port_var.get()]
+        if hasattr(self, "vfd_port_var"):
+            candidates.append(self.vfd_port_var.get())
+        if extra_ports:
+            candidates.extend(extra_ports)
+        ports = {
+            normalized
+            for value in candidates
+            if (normalized := self._normalize_windows_com_port(value))
+        }
+        return sorted(ports, key=self._serial_port_sort_key)
+
+    @staticmethod
+    def _normalize_windows_com_port(value: str) -> str:
+        """Return a canonical Windows COM port name, or an empty string for invalid input."""
+        match = re.fullmatch(r"\s*COM\s*(\d+)\s*", str(value), flags=re.IGNORECASE)
+        if not match or int(match.group(1)) < 1:
+            return ""
+        return f"COM{int(match.group(1))}"
+
+    @staticmethod
+    def _serial_port_sort_key(port: str) -> tuple[int, str]:
+        match = re.search(r"(\d+)$", port)
+        return (int(match.group(1)) if match else 9999, port.upper())
 
     @staticmethod
     def _list_serial_ports() -> list[str]:
@@ -1096,8 +1257,11 @@ class SettingsWindow(tk.Toplevel):
         update_frame.pack(fill="x", padx=10, pady=10)
 
         ttk.Label(update_frame, text="更新源 URL:", font=("Segoe UI", 10)).pack(anchor="w")
-        self.update_url_var = StringVar(value=DEFAULT_UPDATE_MANIFEST_URL)
-        ttk.Label(update_frame, text="填写自定义更新清单 URL（JSON）；留空则使用下方 GitHub Releases 模式",
+        # GitHub Releases is the supported default.  A custom manifest URL is
+        # optional and, when entered, takes precedence.
+        self.update_url_var = StringVar(value="")
+        ttk.Entry(update_frame, textvariable=self.update_url_var, width=72).pack(fill="x", pady=(4, 4))
+        ttk.Label(update_frame, text="填写自定义更新清单 URL（JSON）；留空则使用 GitHub Releases 自动检测",
                    foreground="gray").pack(anchor="w")
 
         # GitHub 模式

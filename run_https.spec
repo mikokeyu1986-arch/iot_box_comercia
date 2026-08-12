@@ -11,7 +11,7 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
-    ['D:/odoo/iot_box_comercia/run_http.py'],
+    ['D:/odoo/iot_box_comercia/run_https.py'],
     pathex=[],
     binaries=binaries,
     datas=datas,
@@ -30,7 +30,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='run_http',
+    name='run_https',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -50,5 +50,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='run_http',
+    name='run_https',
 )

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import socket
+import urllib.request
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -45,6 +46,7 @@ STATIC_DIR = RESOURCE_DIR / "web"
 SPOOL_DIR = Path(os.getenv("IOT_SPOOL_DIR", str(BASE_DIR / "spool")))
 CONFIG_PATH = Path(os.getenv("IOT_CONFIG_PATH", str(BASE_DIR / "runtime_config.json")))
 CERTS_DIR = Path(os.getenv("IOT_CERTS_DIR", str(BASE_DIR / "certs")))
+LOGO_DIR = RESOURCE_DIR / "assets"
 
 
 def _detect_local_ip() -> str:
@@ -111,6 +113,57 @@ def _perf_log(message: str) -> None:
     if os.getenv("IOT_VERBOSE_PERF_LOGS", "").strip().lower() not in {"1", "true", "yes", "on"}:
         return
     print(message, flush=True)
+
+
+def _sync_receipt_logo() -> dict[str, Any]:
+    """Fetch the current company logo from the paired Odoo server and cache it
+    to ``assets/logo.png`` (used by the receipt builder to render the logo).
+
+    The logo endpoint is db-scoped (Odoo 19), so the request is sent with an
+    ``X-Odoo-Database`` header.  A small list of candidate database names is
+    tried (the live Movi database first, then the configured one) so the logo
+    is resolved regardless of which database hosts movi_pos_api.
+    """
+    server_url = str(config_store.get_connection().get("url") or "").strip().rstrip("/")
+    if not server_url:
+        return {"ok": False, "error": "no_server_url"}
+    configured_db = str(config_store.get_connection().get("db_name") or "").strip()
+    candidate_dbs = list(dict.fromkeys(filter(None, ["odoo_spain", configured_db, "odoo_restaurant"])))
+    logo_url = f"{server_url}/movi-api/v1/logo"
+    last_error = ""
+    for db_name in candidate_dbs:
+        try:
+            headers = {"X-Odoo-Database": db_name} if db_name else {}
+            req = urllib.request.Request(logo_url, method="GET", headers=headers)
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                if resp.status != 200:
+                    last_error = f"http_{resp.status}"
+                    continue
+                data = resp.read()
+                if not data:
+                    last_error = "empty"
+                    continue
+                LOGO_DIR.mkdir(parents=True, exist_ok=True)
+                target = LOGO_DIR / "logo.png"
+                target.write_bytes(data)
+                return {"ok": True, "bytes": len(data), "path": str(target), "db": db_name}
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+    return {"ok": False, "error": last_error or "no_matching_db"}
+
+
+async def _sync_receipt_logo_async() -> dict[str, Any]:
+    return await asyncio.to_thread(_sync_receipt_logo)
+
+
+async def _background_logo_sync() -> None:
+    try:
+        await asyncio.sleep(1)
+        result = await _sync_receipt_logo_async()
+        _logger.info("Receipt logo sync at startup: %s", result)
+    except Exception:
+        _logger.exception("Receipt logo sync failed")
 
 app = FastAPI(title="Restaurant Native Print IoT Box Runtime", version=APP_VERSION)
 app.add_middleware(
@@ -251,6 +304,7 @@ async def startup_tasks() -> None:
             _logger.exception("Certificate consistency check failed")
     app.state.spool_cleanup_task = asyncio.create_task(_spool_cleanup_loop())
     await device_manager.startup()
+    app.state.logo_sync_task = asyncio.create_task(_background_logo_sync())
     if scale_service is not None:
         try:
             # 绑定主事件循环，让 ScaleMonitor 子线程能线程安全地推送 SSE 事件
@@ -674,6 +728,30 @@ async def api_status() -> dict[str, Any]:
     }
 
 
+@app.get("/api/logo")
+async def api_logo() -> dict[str, Any]:
+    """Report the IoT Box's locally cached receipt logo (if any)."""
+    logo_path = LOGO_DIR / "logo.png"
+    if not logo_path.is_file():
+        return {"status": "success", "logo": None}
+    stat = logo_path.stat()
+    return {
+        "status": "success",
+        "logo": {
+            "path": str(logo_path),
+            "bytes": stat.st_size,
+            "mtime": int(stat.st_mtime),
+        },
+    }
+
+
+@app.post("/api/logo/sync")
+async def api_logo_sync() -> dict[str, Any]:
+    """Refresh the locally cached receipt logo from Odoo."""
+    result = await _sync_receipt_logo_async()
+    return {"status": "success" if result.get("ok") else "error", **result}
+
+
 def _legacy_iot_status_payload() -> dict[str, Any]:
     local_config = config_store.get_local_config()
     return {
@@ -993,6 +1071,92 @@ async def legacy_hw_proxy_open_cashbox(request: Request) -> dict[str, Any]:
     return await _legacy_print(request, action="cashbox")
 
 
+@app.post("/printer_iot/printer")
+async def printer_iot_kitchen_print(request: Request) -> dict[str, Any]:
+    """Handle kitchen order print requests from the Movi Flutter app.
+
+    The Flutter app sends kitchen print payloads directly to the IoT Box:
+    {
+        "device_identifier": "printer_main",
+        "receipts": [
+            {"pos_reference": "Order 00003", "changes": {"title": "NEW", ...}, ...}
+        ]
+    }
+
+    Each receipt is wrapped as raw kitchen order_data so that the ESC/POS
+    driver renders it as a kitchen ticket via _build_kitchen_from_order_data.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "Invalid JSON body"},
+        )
+
+    if not isinstance(body, dict):
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "JSON body must be an object"},
+        )
+
+    device_identifier = str(body.get("device_identifier", "")).strip()
+    receipts = body.get("receipts") or []
+
+    if not device_identifier:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "Missing device_identifier"},
+        )
+    if not isinstance(receipts, list) or not receipts:
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": "Missing or empty receipts array"},
+        )
+
+    session_id = str(
+        config_store.get_local_config().get("printer_identifier")
+        or f"printer-iot-{int(asyncio.get_running_loop().time() * 1000)}"
+    )
+
+    results: list[dict[str, Any]] = []
+    has_error = False
+    for idx, receipt_data in enumerate(receipts):
+        if not isinstance(receipt_data, dict):
+            continue
+        try:
+            # Wrap in order_data so _process_receipt_escpos recognizes it
+            # as raw kitchen order data and calls _build_kitchen_from_order_data
+            print_data: dict[str, Any] = {
+                "action": "print_receipt_escpos",
+                "receipt": {"order_data": receipt_data},
+            }
+            success = await device_manager.execute(session_id, device_identifier, print_data)
+            results.append({"index": idx, "ok": success})
+            if not success:
+                has_error = True
+        except Exception as exc:
+            results.append({"index": idx, "ok": False, "error": str(exc)})
+            has_error = True
+            _logger.exception(
+                "printer_iot_printer receipt failed index=%s device=%s error=%s",
+                idx,
+                device_identifier,
+                exc,
+            )
+
+    dev_log(
+        "printer_iot_printer",
+        device_identifier=device_identifier,
+        receipt_count=len(receipts),
+        results_count=len(results),
+        has_error=has_error,
+    )
+
+    if has_error:
+        return {"status": "partial_error", "results": results}
+    return {"status": "ok", "results": results}
+
 
 @app.get("/api/cert/crt", response_class=FileResponse)
 async def api_cert_crt() -> FileResponse:
@@ -1063,6 +1227,7 @@ async def api_connect(payload: dict[str, Any]) -> dict[str, Any]:
     token_url = str(payload.get("token_url", "")).strip()
     if not token_url:
         raise HTTPException(status_code=400, detail="token_url is required")
+    previous_connection = config_store.get_connection()
     try:
         connection = config_store.connect_from_token_url(token_url)
     except ValueError as exc:
@@ -1096,7 +1261,15 @@ async def api_connect(payload: dict[str, Any]) -> dict[str, Any]:
                 "Odoo /iot/setup returned no iot_channel. "
                 "Please generate a new pairing token and verify the Odoo port."
             )
-        config_store.reset_connection(message=message)
+        # Keep the previous, working binding if a replacement token/server
+        # cannot be validated.  Users can immediately paste another token
+        # instead of deleting runtime_config.json by hand.
+        if previous_connection.get("connected") and previous_connection.get("url"):
+            previous_connection["last_sync_ok"] = False
+            previous_connection["last_sync_message"] = f"Binding change failed: {message}"
+            config_store.replace_connection(previous_connection)
+        else:
+            config_store.reset_connection(message=message)
         dev_log(
             "api_connect_failed",
             server_url=connection.get("url", ""),

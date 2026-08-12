@@ -417,6 +417,9 @@ def _render_product_lines(line: dict[str, Any], layout: dict[str, Any], width: i
                     + (" " * gutter_width) + _pad_left("", amount_width)
                 ), width),
                 "align": "left",
+                # Combo (套餐) children — including their quantity suffix — are
+                # printed bold to stand out on the receipt.
+                "bold": True,
                 "classes": ["receipt-product-option-row"],
             })
     unit_price = str(line.get("unit_price") or "").strip()

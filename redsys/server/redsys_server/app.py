@@ -238,17 +238,28 @@ main{{max-width:520px;margin:auto;background:white;border-radius:14px;padding:28
 h1{{margin-top:0}} label{{display:block;font-weight:600;margin:18px 0 6px}}
 input{{width:100%;box-sizing:border-box;padding:13px;font-size:22px;border:1px solid #cbd5e1;border-radius:8px}}
 button{{padding:12px 18px;border:0;border-radius:8px;font-size:16px;cursor:pointer;margin:18px 8px 0 0}}
-.pay{{background:#1167d8;color:white}} .cancel{{background:#e5e7eb}} #status{{margin-top:22px;padding:12px;background:#eef2ff;border-radius:8px;white-space:pre-wrap}}
+.pay{{background:#1167d8;color:white}} .test{{background:#0f766e;color:white}} .cancel{{background:#e5e7eb}} #status{{margin-top:22px;padding:12px;background:#eef2ff;border-radius:8px;white-space:pre-wrap}}
 .meta{{color:#64748b;font-size:14px}}
 </style></head><body><main>
 <h1>REDSYS · Pago con tarjeta</h1><div class="meta">Terminal {config.merchant_terminal} · Servicio {config.host}:{config.port}</div>
 <label for="amount">Importe (€)</label><input id="amount" inputmode="decimal" value="0.01" autocomplete="off">
 <label for="order">Pedido / referencia</label><input id="order" value="POS-" autocomplete="off">
-<button class="pay" onclick="pay()">Iniciar刷卡</button><button class="cancel" onclick="cancelPay()">Cancelar</button>
+<button class="test" onclick="testReader()">测试读卡器</button><button class="pay" onclick="pay()">Iniciar刷卡</button><button class="cancel" onclick="cancelPay()">Cancelar</button>
 <div id="status">Listo para iniciar una operación.</div>
 <script>
 const statusBox=document.getElementById('status');
 function setStatus(v){{statusBox.textContent=v;}}
+async function testReader(){{
+  setStatus('正在测试 COM 连接…');
+  try{{
+    const r=await fetch('/connect'); const result=await r.json();
+    if(result.connected){{
+      setStatus('读卡器连接成功。COM 端口和 REDSYS 桥接均正常。');
+    }} else {{
+      setStatus('读卡器连接失败：'+(result.error||'未知错误'));
+    }}
+  }} catch(e){{setStatus('无法测试读卡器：'+e.message);}}
+}}
 async function pay(){{
   const raw=document.getElementById('amount').value.replace(',','.');
   const amount=Math.round(Number(raw)*100); const order=document.getElementById('order').value.trim()||('POS-'+Date.now());

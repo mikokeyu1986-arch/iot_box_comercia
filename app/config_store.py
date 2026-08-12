@@ -30,6 +30,12 @@ class ConfigStore:
             "printer_identifier": "",
             "primary_printer_queue": "",
             "enabled_printer_queues": [],
+            "epson_discovery_enabled": True,
+            "epson_printer_hosts": [],
+            "epson_discovery_subnets": [],
+            "epson_discovery_port": 9100,
+            "epson_discovery_timeout": 0.12,
+            "epson_discovery_workers": 64,
             "scale_port": "",
             "scale_baudrate": 9600,
             "scale_timeout": 1.2,
@@ -152,6 +158,13 @@ class ConfigStore:
             self._data["server_connection"] = connection
             self._save()
             return dict(connection)
+
+    def replace_connection(self, connection: dict[str, Any]) -> dict[str, Any]:
+        """Atomically replace a connection, used to restore a failed rebind."""
+        with self._lock:
+            self._data["server_connection"] = dict(connection)
+            self._save()
+            return dict(self._data["server_connection"])
 
     def set_sync_status(self, ok: bool, message: str) -> None:
         with self._lock:

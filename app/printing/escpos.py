@@ -563,7 +563,11 @@ class EscposEncodingMixin:
                     combo_line = " " * (qty_width + 1) + self._pad_right(combo_indent + row, name_width)
                     if total:
                         combo_line += " " + " " * total_width
+                    # Combo (套餐) children — including their quantity suffix
+                    # (e.g. "x2") — are printed bold to stand out.
+                    chunks.append(self._escpos_emphasis(True))
                     chunks.append(self._escpos_safe_text(combo_line, encoding).encode(encoding, errors="replace"))
+                    chunks.append(self._escpos_emphasis(False))
                     chunks.append(self._escpos_text_newline())
         if discount_text:
             discount_label = self._format_discount_text(discount_text, total, original_total)

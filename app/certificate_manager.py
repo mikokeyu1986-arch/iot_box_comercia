@@ -9,6 +9,7 @@ available uvicorn will raise a clear error at startup.
 from __future__ import annotations
 
 import ipaddress
+import ctypes
 import os
 import secrets
 import shutil
@@ -54,6 +55,44 @@ class CertificateManager:
             "password_configured": bool(self.p12_password),
             "password_file": str(self.password_path),
         }
+
+    def install_windows_trusted_root(self) -> bool:
+        """Trust this self-signed certificate for the current Windows user.
+
+        The current-user Root store avoids administrator privileges and is used
+        by Chromium-based browsers on Windows.  Non-Windows deployments keep
+        their normal certificate-management workflow.
+        """
+        if os.name != "nt":
+            return False
+        self.ensure()
+        # Avoid certutil/PowerShell: both can hang when certificate-management
+        # policy is slow to respond.  Crypt32 writes directly to the current
+        # user's Root store and does not require elevation.
+        cert_der = ssl.PEM_cert_to_DER_cert(self.crt_path.read_text(encoding="ascii"))
+        cert_buffer = ctypes.create_string_buffer(cert_der)
+        crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+        crypt32.CertOpenSystemStoreW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+        crypt32.CertOpenSystemStoreW.restype = ctypes.c_void_p
+        crypt32.CertAddEncodedCertificateToStore.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.c_uint32, ctypes.c_void_p,
+        ]
+        crypt32.CertAddEncodedCertificateToStore.restype = ctypes.c_bool
+        crypt32.CertCloseStore.argtypes = [ctypes.c_void_p, ctypes.c_uint32]
+        crypt32.CertCloseStore.restype = ctypes.c_bool
+        store = crypt32.CertOpenSystemStoreW(None, "ROOT")
+        if not store:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            # X509_ASN_ENCODING | PKCS_7_ASN_ENCODING; replace matching cert.
+            if not crypt32.CertAddEncodedCertificateToStore(
+                store, 0x00010001, cert_buffer, len(cert_der), 4, None
+            ):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            crypt32.CertCloseStore(store, 0)
+        return True
 
     def _ensure_p12_password(self) -> bool:
         if self.p12_password:

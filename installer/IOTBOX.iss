@@ -24,6 +24,8 @@ SetupIconFile=..\assets\iotbox-icon.ico
 [Files]
 Source: "..\dist\gui_app\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 Source: "..\dist\run_http\*"; DestDir: "{app}\runtime"; Flags: recursesubdirs ignoreversion
+Source: "..\dist\run_https\*"; DestDir: "{app}\runtime"; Flags: recursesubdirs ignoreversion
+Source: "..\dist\redsys_server\*"; DestDir: "{app}\runtime\redsys_server"; Flags: recursesubdirs ignoreversion
 Source: "..\assets\iotbox-icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\runtime_config.json"; DestDir: "{app}"; Flags: onlyifdoesntexist ignoreversion
 
@@ -42,6 +44,8 @@ begin
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM gui_app.exe', '', SW_HIDE,
        ewWaitUntilTerminated, ResultCode);
   Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM run_http.exe', '', SW_HIDE,
+       ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM run_https.exe', '', SW_HIDE,
        ewWaitUntilTerminated, ResultCode);
   Sleep(800);
   Result := '';

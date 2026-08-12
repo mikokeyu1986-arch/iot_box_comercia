@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import ssl
 import time
 from urllib.parse import quote
@@ -67,6 +68,7 @@ class OdooSyncService:
                     "version": version,
                     "token": token,
                     "mac": identifier,
+                    "admin_token": os.getenv("IOT_ADMIN_TOKEN", "").strip(),
                 },
                 "devices": devices,
             },

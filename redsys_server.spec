@@ -1,21 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
-
-datas = [('D:/odoo/iot_box_comercia/web', 'web'), ('D:/odoo/iot_box_comercia/certs', 'certs'), ('D:/odoo/iot_box_comercia/runtime_config.json', '.')]
-binaries = []
-hiddenimports = []
-tmp_ret = collect_all('uvicorn')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('fastapi')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
-    ['D:/odoo/iot_box_comercia/run_http.py'],
+    ['D:/odoo/iot_box_comercia/redsys/server/main.py'],
     pathex=[],
-    binaries=binaries,
-    datas=datas,
-    hiddenimports=hiddenimports,
+    binaries=[],
+    datas=[('D:/odoo/iot_box_comercia/redsys', 'redsys')],
+    hiddenimports=[],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -30,7 +21,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='run_http',
+    name='redsys_server',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -50,5 +41,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='run_http',
+    name='redsys_server',
 )
